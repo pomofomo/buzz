@@ -1079,8 +1079,7 @@ fn validate_persona_envelope(event: &Event) -> Result<(), String> {
 /// This is an envelope sanity check, not full validation: the MAC and actual
 /// decryption happen at the reader. The intent is to refuse obvious junk so a
 /// malformed event cannot win NIP-33 replacement against a valid head and then
-/// be silently skipped by `validate_and_decrypt`. Mirrors the validator in
-/// `buzz-pair-relay::validate_nip44_content`.
+/// be silently skipped by `validate_and_decrypt`.
 fn validate_engram_nip44_content(content: &str) -> Result<(), String> {
     if content.is_empty() {
         return Err("agent-engram content must not be empty (NIP-44 ciphertext)".to_string());
