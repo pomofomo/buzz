@@ -13,6 +13,7 @@ pub mod upload;
 pub mod upload_record;
 pub mod validation;
 
+pub use auth::UploadAuthz;
 pub use bucket_index::{
     classify_key, fold_bucket_listing, BucketAggregate, BucketSnapshot, CommunityStorage, KeyClass,
     Page, SweepError,

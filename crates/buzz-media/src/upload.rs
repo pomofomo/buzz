@@ -5,7 +5,7 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
-use crate::auth::verify_blossom_upload_auth;
+use crate::auth::{verify_blossom_upload_auth, UploadAuthz};
 use crate::config::MediaConfig;
 use crate::error::MediaError;
 use crate::storage::{BlobMeta, MediaStorage};
@@ -46,7 +46,7 @@ struct BufferedUploadInput<'a> {
     storage: &'a MediaStorage,
     config: &'a MediaConfig,
     ctx: &'a TenantContext,
-    auth_event: &'a nostr::Event,
+    authz: UploadAuthz<'a>,
     body: Bytes,
     attribution: Option<UploadAttribution>,
 }
@@ -65,13 +65,22 @@ where
         storage,
         config,
         ctx,
-        auth_event,
+        authz,
         body,
         attribution,
     } = input;
 
-    // CPU-bound: validate content, compute hash, verify auth.
-    let auth = auth_event.clone();
+    // The uploading actor (Blossom signer or bearer-resolved actor id) drives
+    // attribution/records; the same value in both modes (decision #2).
+    let actor = authz.actor();
+
+    // CPU-bound: validate content, compute hash, and — in nostr/Blossom mode —
+    // re-verify the auth event's `x` tag binds the server-computed hash. In
+    // `apikey` mode there is no signed event: the body is bound to its SHA-256
+    // directly by content-addressing (the stored key is the hash), so the
+    // Blossom re-verify is skipped. Cloning the event (only in Blossom mode)
+    // detaches it from the borrow so the closure is `'static`.
+    let blossom = authz.blossom_event().cloned();
     let bytes = body.clone();
     let cfg = config.clone();
     // Validate the Blossom `server` tag against the host this request was bound
@@ -81,8 +90,10 @@ where
     let (mime, sha256, ext) = tokio::task::spawn_blocking(move || -> Result<_, MediaError> {
         let (mime, ext) = validate(&bytes, &cfg)?;
         let sha256 = hex::encode(Sha256::digest(&bytes));
-        // Buffered uploads (image + file): 10-minute auth window is plenty.
-        verify_blossom_upload_auth(&auth, &sha256, Some(bound_host.as_str()), 600)?;
+        if let Some(event) = blossom.as_ref() {
+            // Buffered uploads (image + file): 10-minute auth window is plenty.
+            verify_blossom_upload_auth(event, &sha256, Some(bound_host.as_str()), 600)?;
+        }
         Ok((mime, sha256, ext))
     })
     .await
@@ -105,7 +116,7 @@ where
             record_upload_event(
                 storage,
                 ctx,
-                &auth_event.pubkey,
+                &actor,
                 attribution,
                 UploadEventFacts {
                     sha256: &sha256,
@@ -163,7 +174,7 @@ where
         record_upload_event(
             storage,
             ctx,
-            &auth_event.pubkey,
+            &actor,
             attribution,
             UploadEventFacts {
                 sha256: &sha256,
@@ -208,7 +219,7 @@ pub async fn process_upload(
     storage: &MediaStorage,
     config: &MediaConfig,
     ctx: &TenantContext,
-    auth_event: &nostr::Event,
+    authz: UploadAuthz<'_>,
     body: Bytes,
     attribution: Option<UploadAttribution>,
 ) -> Result<BlobDescriptor, MediaError> {
@@ -217,7 +228,7 @@ pub async fn process_upload(
             storage,
             config,
             ctx,
-            auth_event,
+            authz,
             body,
             attribution,
         },
@@ -246,7 +257,7 @@ pub async fn process_file_upload(
     storage: &MediaStorage,
     config: &MediaConfig,
     ctx: &TenantContext,
-    auth_event: &nostr::Event,
+    authz: UploadAuthz<'_>,
     body: Bytes,
     attribution: Option<UploadAttribution>,
 ) -> Result<BlobDescriptor, MediaError> {
@@ -255,7 +266,7 @@ pub async fn process_file_upload(
             storage,
             config,
             ctx,
-            auth_event,
+            authz,
             body,
             attribution,
         },
@@ -293,11 +304,13 @@ pub async fn process_video_upload(
     storage: &MediaStorage,
     config: &MediaConfig,
     ctx: &TenantContext,
-    auth_event: &nostr::Event,
+    authz: UploadAuthz<'_>,
     body_stream: impl futures_core::Stream<Item = Result<Bytes, axum::Error>> + Send + 'static,
     content_length: Option<u64>,
     attribution: Option<UploadAttribution>,
 ) -> Result<BlobDescriptor, MediaError> {
+    // The uploading actor (Blossom signer or bearer-resolved actor id).
+    let actor = authz.actor();
     // --- 1. Stream body to temp file, compute SHA-256 incrementally ---
     let tmp = tempfile::NamedTempFile::new().map_err(|e| MediaError::Io(e.to_string()))?;
     let tmp_path = tmp.path().to_path_buf();
@@ -402,17 +415,23 @@ pub async fn process_video_upload(
     let mime = "video/mp4".to_string();
 
     // --- 3. Verify Blossom auth: x tag must match computed SHA-256 ---
-    let auth = auth_event.clone();
-    let sha256_for_auth = sha256_hex.clone();
-    // Validate the Blossom `server` tag against the bound tenant host (not a
-    // process-global domain) — a relay serves many tenant hosts.
-    let bound_host = ctx.host().to_string();
-    tokio::task::spawn_blocking(move || {
-        // Videos: 1-hour window — large uploads on slow connections need headroom.
-        verify_blossom_upload_auth(&auth, &sha256_for_auth, Some(bound_host.as_str()), 3600)
-    })
-    .await
-    .map_err(|_| MediaError::Internal)??;
+    // Nostr/Blossom mode only. In `apikey` mode the body is bound to its
+    // SHA-256 directly by content-addressing (the stored key is the hash), so
+    // there is no `x` tag to re-verify — the actor was already authenticated,
+    // `files:write`-scoped, and membership-checked at the HTTP door.
+    if let Some(auth_event) = authz.blossom_event() {
+        let auth = auth_event.clone();
+        let sha256_for_auth = sha256_hex.clone();
+        // Validate the Blossom `server` tag against the bound tenant host (not a
+        // process-global domain) — a relay serves many tenant hosts.
+        let bound_host = ctx.host().to_string();
+        tokio::task::spawn_blocking(move || {
+            // Videos: 1-hour window — large uploads on slow connections need headroom.
+            verify_blossom_upload_auth(&auth, &sha256_for_auth, Some(bound_host.as_str()), 3600)
+        })
+        .await
+        .map_err(|_| MediaError::Internal)??;
+    }
 
     // --- 4. Full MP4 validation on the temp file ---
     let tmp_path_clone = tmp_path.clone();
@@ -437,7 +456,7 @@ pub async fn process_video_upload(
             record_upload_event(
                 storage,
                 ctx,
-                &auth_event.pubkey,
+                &actor,
                 attribution,
                 UploadEventFacts {
                     sha256: &sha256_hex,
@@ -483,7 +502,7 @@ pub async fn process_video_upload(
         record_upload_event(
             storage,
             ctx,
-            &auth_event.pubkey,
+            &actor,
             attribution,
             UploadEventFacts {
                 sha256: &sha256_hex,
