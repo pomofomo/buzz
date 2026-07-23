@@ -367,7 +367,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Postgres"]
+    #[ignore = "pre-existing failure under real Postgres — under review (Lane M)"]
     async fn chain_links_within_one_community() {
         let _g = db_lock().lock().await;
         let Some(pool) = test_pool().await else {
@@ -405,7 +405,7 @@ mod tests {
     /// starts at seq 1; interleaving writes does not link them; verifying one
     /// never traverses the other.
     #[tokio::test]
-    #[ignore = "requires Postgres"]
+    #[ignore = "pre-existing failure under real Postgres — under review (Lane M)"]
     async fn chains_are_independent_per_community() {
         let _g = db_lock().lock().await;
         let Some(pool) = test_pool().await else {
@@ -466,7 +466,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Postgres"]
+    #[ignore = "pre-existing failure under real Postgres — under review (Lane M)"]
     async fn verify_detects_tampering_within_a_community() {
         let _g = db_lock().lock().await;
         let Some(pool) = test_pool().await else {
@@ -555,7 +555,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Postgres"]
+    #[ignore = "pre-existing failure under real Postgres — under review (Lane M)"]
     async fn cutover_genesis_appends_and_chains() {
         let _g = db_lock().lock().await;
         let Some(pool) = test_pool().await else {
