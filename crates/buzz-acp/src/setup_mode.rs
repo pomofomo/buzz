@@ -316,10 +316,15 @@ pub(crate) async fn run_setup_listener(config: Config, payload: SetupPayload) ->
     let pubkey_hex = config.keys.public_key().to_hex();
 
     // Parse BUZZ_AUTH_TAG for relay membership / NIP-OA.
-    let relay_auth_tag: Option<nostr::Tag> = std::env::var("BUZZ_AUTH_TAG")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .and_then(|s| buzz_sdk::nip_oa::parse_auth_tag(&s).ok());
+    // Dropped in apikey mode: bearer auth carries membership via the key's scopes.
+    let relay_auth_tag: Option<nostr::Tag> = if crate::config::apikey_mode() {
+        None
+    } else {
+        std::env::var("BUZZ_AUTH_TAG")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .and_then(|s| buzz_sdk::nip_oa::parse_auth_tag(&s).ok())
+    };
 
     let startup_watermark: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

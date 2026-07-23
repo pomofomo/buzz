@@ -57,10 +57,15 @@ const PASSTHROUGH_ENV: &[&str] = &[
     // and BUZZ_RELAY_URL are kept for the buzz CLI. BUZZ_AUTH_TAG is a
     // non-secret signed ownership attestation needed by portable owner-scoped
     // CLI operations; MCP subprocesses are trusted like the agent runtime.
+    // BUZZ_API_KEY is the apikey-mode bearer credential (replaces BUZZ_AUTH_TAG
+    // in that mode); BUZZ_AUTH_MODE selects the doorway. Both are forwarded so
+    // the buzz CLI authenticates identically whichever mode is active.
     "NOSTR_PRIVATE_KEY",
     "BUZZ_PRIVATE_KEY",
     "BUZZ_RELAY_URL",
     "BUZZ_AUTH_TAG",
+    "BUZZ_API_KEY",
+    "BUZZ_AUTH_MODE",
 ];
 
 // Windows has no $TMPDIR/$HOME. TMP/TEMP/USERPROFILE are what
@@ -994,6 +999,13 @@ mod content_tests {
     #[test]
     fn passthrough_includes_buzz_owner_attestation() {
         assert!(PASSTHROUGH_ENV.contains(&"BUZZ_AUTH_TAG"));
+    }
+
+    #[test]
+    fn passthrough_includes_apikey_credentials() {
+        // apikey-mode bearer credential + doorway selector must reach the buzz CLI.
+        assert!(PASSTHROUGH_ENV.contains(&"BUZZ_API_KEY"));
+        assert!(PASSTHROUGH_ENV.contains(&"BUZZ_AUTH_MODE"));
     }
     use rmcp::model::Content;
 

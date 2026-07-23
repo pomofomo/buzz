@@ -116,11 +116,20 @@ fn emit_runtime_lifecycle(
 
 /// Resolve the agent's owner pubkey at startup.
 ///
-/// Priority:
+/// Priority (nostr mode):
 /// 1. `BUZZ_AUTH_TAG` env var — NIP-OA attestation signed by the owner.
 ///    Verified against the agent's own pubkey to extract the owner pubkey.
 /// 2. `--agent-owner` CLI flag / `BUZZ_ACP_AGENT_OWNER` env var.
+///
+/// In **apikey mode** the NIP-OA attestation path is skipped entirely (the
+/// bearer key's stored scopes carry the owner authority); the owner is taken
+/// directly from `--agent-owner` / `BUZZ_ACP_AGENT_OWNER`.
 fn resolve_agent_owner(config: &Config) -> Option<String> {
+    // apikey mode: no NIP-OA owner resolution — use the explicit owner flag.
+    if config::apikey_mode() {
+        return config.agent_owner.clone();
+    }
+
     // Try BUZZ_AUTH_TAG first (NIP-OA attestation).
     if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
         if !auth_tag.is_empty() {
@@ -1287,10 +1296,15 @@ async fn tokio_main() -> Result<()> {
     let pubkey_hex = config.keys.public_key().to_hex();
 
     // Parse BUZZ_AUTH_TAG into a nostr::Tag for NIP-OA relay membership delegation.
-    let relay_auth_tag: Option<nostr::Tag> = std::env::var("BUZZ_AUTH_TAG")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .and_then(|s| buzz_sdk::nip_oa::parse_auth_tag(&s).ok());
+    // Dropped in apikey mode: bearer auth carries membership via the key's scopes.
+    let relay_auth_tag: Option<nostr::Tag> = if config::apikey_mode() {
+        None
+    } else {
+        std::env::var("BUZZ_AUTH_TAG")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .and_then(|s| buzz_sdk::nip_oa::parse_auth_tag(&s).ok())
+    };
 
     let mut relay =
         HarnessRelay::connect(&config.relay_url, &config.keys, &pubkey_hex, relay_auth_tag)
@@ -4069,14 +4083,28 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
                         .expect("secret key bech32 encoding should never fail"),
                 },
             ];
-            // Forward BUZZ_AUTH_TAG (NIP-OA owner attestation credential)
-            // so the MCP server can attach it to every signed event.
-            if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
-                if !auth_tag.is_empty() {
-                    env.push(EnvVar {
-                        name: "BUZZ_AUTH_TAG".into(),
-                        value: auth_tag,
-                    });
+            if config::apikey_mode() {
+                // apikey mode: forward the bearer token so the MCP server's `buzz`
+                // CLI authenticates with `Authorization: Bearer <key>`. The NIP-OA
+                // auth tag is NOT forwarded — the key's scopes carry that authority.
+                if let Ok(api_key) = std::env::var("BUZZ_API_KEY") {
+                    if !api_key.is_empty() {
+                        env.push(EnvVar {
+                            name: "BUZZ_API_KEY".into(),
+                            value: api_key,
+                        });
+                    }
+                }
+            } else {
+                // nostr mode: forward BUZZ_AUTH_TAG (NIP-OA owner attestation
+                // credential) so the MCP server can attach it to every signed event.
+                if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
+                    if !auth_tag.is_empty() {
+                        env.push(EnvVar {
+                            name: "BUZZ_AUTH_TAG".into(),
+                            value: auth_tag,
+                        });
+                    }
                 }
             }
             env
@@ -4699,6 +4727,31 @@ mod build_mcp_servers_tests {
         let server = &servers[0];
         let has_auth_tag = server.env.iter().any(|e| e.name == "BUZZ_AUTH_TAG");
         assert!(!has_auth_tag, "empty BUZZ_AUTH_TAG should not be forwarded");
+    }
+
+    /// In apikey mode the MCP server env carries BUZZ_API_KEY (bearer) and NOT
+    /// BUZZ_AUTH_TAG, even when a NIP-OA tag is present in the environment.
+    #[test]
+    fn session_new_mcp_server_apikey_mode_forwards_api_key_not_auth_tag() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("BUZZ_API_KEY", "bearer-secret");
+        std::env::set_var("BUZZ_AUTH_TAG", "test-attestation-tag");
+        let config = test_config();
+        let servers = build_mcp_servers(&config);
+        std::env::remove_var("BUZZ_API_KEY");
+        std::env::remove_var("BUZZ_AUTH_TAG");
+
+        let server = &servers[0];
+        let api_key_env = server.env.iter().find(|e| e.name == "BUZZ_API_KEY");
+        assert!(
+            api_key_env.is_some(),
+            "BUZZ_API_KEY should be forwarded in apikey mode"
+        );
+        assert_eq!(api_key_env.unwrap().value, "bearer-secret");
+        assert!(
+            !server.env.iter().any(|e| e.name == "BUZZ_AUTH_TAG"),
+            "BUZZ_AUTH_TAG must NOT be forwarded in apikey mode"
+        );
     }
 
     #[test]
