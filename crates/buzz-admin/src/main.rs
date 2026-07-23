@@ -20,6 +20,8 @@
 //! newest timestamp and collide on the bumped second. run.sh serialization is
 //! the guard against parallel adds (e.g. `xargs -P`).
 
+mod apikey;
+
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -30,6 +32,7 @@ use buzz_pubsub::{EventTopic, PubSubManager};
 use clap::{Parser, Subcommand};
 use nostr::{EventBuilder, Keys, Kind, Tag};
 use tracing::warn;
+use uuid::Uuid;
 
 #[derive(Parser)]
 #[command(name = "buzz-admin", about = "Buzz instance administration")]
@@ -73,7 +76,77 @@ enum Command {
     /// List all relay members.
     ListMembers,
     /// Generate a new Nostr keypair (for bootstrapping).
+    ///
+    /// This mints a relay *identity* keypair (the value for
+    /// `BUZZ_RELAY_PRIVATE_KEY`, used to sign kind:13534 rosters and reconcile
+    /// events). It does NOT issue an API access key — use `issue-key` for that.
     GenerateKey,
+    /// Issue a new API key for an actor and print the plaintext once.
+    ///
+    /// Generates a cryptographically-random token, stores only its SHA-256
+    /// hash (scope + actor + optional channel restriction + optional expiry),
+    /// and prints the plaintext token exactly once. The plaintext is never
+    /// logged or persisted — capture it immediately.
+    IssueKey {
+        /// Actor id the key authenticates as — 64-char hex or bech32 npub.
+        /// For continuity this may equal an existing user's pubkey.
+        #[arg(long)]
+        actor: String,
+
+        /// Authorization scope(s). Repeat the flag or comma-separate, e.g.
+        /// `--scope messages:read,messages:write` or `--scope messages:read
+        /// --scope files:read`.
+        #[arg(long = "scope", value_delimiter = ',', required = true)]
+        scope: Vec<String>,
+
+        /// Optional per-key channel restriction (channel UUID). Repeat to
+        /// allow several. Omit for no per-key channel narrowing.
+        #[arg(long = "channel")]
+        channel: Vec<Uuid>,
+
+        /// Human-readable label stored with the key (for `list-keys`).
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Optional expiry — an RFC3339 timestamp (2026-08-01T00:00:00Z) or a
+        /// relative duration (30d, 12h, 90m, 3600s). Omit for a non-expiring key.
+        #[arg(long)]
+        expires: Option<String>,
+    },
+    /// Revoke a single API key by its token id.
+    RevokeKey {
+        /// Actor id that owns the key — 64-char hex or bech32 npub.
+        #[arg(long)]
+        actor: String,
+
+        /// Token id (UUID) to revoke, as shown by `list-keys`.
+        #[arg(long)]
+        id: Uuid,
+    },
+    /// Revoke every active API key owned by an actor.
+    RevokeAllKeys {
+        /// Actor id whose keys to revoke — 64-char hex or bech32 npub.
+        #[arg(long)]
+        actor: String,
+    },
+    /// List an actor's API keys (never prints any secret).
+    ListKeys {
+        /// Actor id whose keys to list — 64-char hex or bech32 npub.
+        #[arg(long)]
+        actor: String,
+    },
+    /// Rotate an API key: revoke it and issue a replacement with the same
+    /// scopes, channel restriction, name, and expiry. Prints the new plaintext
+    /// once.
+    RotateKey {
+        /// Actor id that owns the key — 64-char hex or bech32 npub.
+        #[arg(long)]
+        actor: String,
+
+        /// Token id (UUID) to rotate, as shown by `list-keys`.
+        #[arg(long)]
+        id: Uuid,
+    },
     /// Run pending database migrations.
     Migrate,
     /// Inspect deployment-wide Buzz product feedback.
@@ -152,7 +225,301 @@ async fn run(cli: Cli) -> Result<i32> {
             reconcile_channels(relay_key).await?;
             Ok(0)
         }
+        Command::IssueKey {
+            actor,
+            scope,
+            channel,
+            name,
+            expires,
+        } => cmd_issue_key(actor, scope, channel, name, expires).await,
+        Command::RevokeKey { actor, id } => cmd_revoke_key(actor, id).await,
+        Command::RevokeAllKeys { actor } => cmd_revoke_all_keys(actor).await,
+        Command::ListKeys { actor } => cmd_list_keys(actor).await,
+        Command::RotateKey { actor, id } => cmd_rotate_key(actor, id).await,
     }
+}
+
+/// Parse an actor id (64-char hex or bech32 npub) into `(32 raw bytes, hex)`.
+///
+/// The actor id occupies the `owner_pubkey` column, which is FK-constrained to
+/// an existing `users` row and validated as an x-only public key by the relay's
+/// bearer verification, so we parse through [`nostr::PublicKey`] to guarantee a
+/// well-formed 32-byte identity.
+fn parse_actor(input: &str) -> std::result::Result<(Vec<u8>, String), String> {
+    let pk = nostr::PublicKey::parse(input).map_err(|e| {
+        format!("invalid actor id '{input}': {e} (expected 64-char hex or bech32 npub)")
+    })?;
+    Ok((pk.to_bytes().to_vec(), pk.to_hex()))
+}
+
+async fn cmd_issue_key(
+    actor_arg: String,
+    scope_args: Vec<String>,
+    channels: Vec<Uuid>,
+    name: Option<String>,
+    expires_arg: Option<String>,
+) -> Result<i32> {
+    let (actor_bytes, actor_hex) = match parse_actor(&actor_arg) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return Ok(1);
+        }
+    };
+
+    let scopes = match apikey::validate_scopes(&scope_args) {
+        Ok(s) => s,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return Ok(1);
+        }
+    };
+
+    let expires_at = match expires_arg
+        .as_deref()
+        .map(apikey::parse_expires)
+        .transpose()
+    {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return Ok(1);
+        }
+    };
+
+    let name = name
+        .unwrap_or_else(|| format!("admin-key-{}", chrono::Utc::now().format("%Y%m%dT%H%M%SZ")));
+
+    let db = connect_db().await?;
+    let tenant = resolve_admin_tenant(&db).await?;
+
+    let channel_ids: Option<&[Uuid]> = if channels.is_empty() {
+        None
+    } else {
+        Some(&channels)
+    };
+
+    let (token, hash) = apikey::generate_token();
+
+    let id = match db
+        .create_api_token(
+            tenant.community(),
+            &hash,
+            &actor_bytes,
+            &name,
+            &scopes,
+            channel_ids,
+            expires_at,
+        )
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!(
+                "error: failed to store API key: {e}\n\
+                 (the actor must be an existing user in this community — the \
+                 owner_pubkey column is foreign-keyed to users; add the actor \
+                 first if this is a foreign-key violation)"
+            );
+            return Ok(5);
+        }
+    };
+
+    print!(
+        "{}",
+        apikey::format_issued_token(
+            "issued",
+            &token,
+            id,
+            &actor_hex,
+            &scopes,
+            channel_ids,
+            expires_at,
+        )
+    );
+    Ok(0)
+}
+
+async fn cmd_revoke_key(actor_arg: String, id: Uuid) -> Result<i32> {
+    let (actor_bytes, _actor_hex) = match parse_actor(&actor_arg) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return Ok(1);
+        }
+    };
+
+    let db = connect_db().await?;
+    let tenant = resolve_admin_tenant(&db).await?;
+
+    // `revoked_by` is an attribution label (no FK); record the acting admin as
+    // the actor itself, since the CLI has no distinct operator identity.
+    let revoked = db
+        .revoke_token(tenant.community(), id, &actor_bytes, &actor_bytes)
+        .await?;
+
+    if revoked {
+        println!("revoked key {id}");
+        Ok(0)
+    } else {
+        eprintln!(
+            "error: no active key {id} for this actor \
+             (not found, not owned by the actor, or already revoked)"
+        );
+        Ok(2)
+    }
+}
+
+async fn cmd_revoke_all_keys(actor_arg: String) -> Result<i32> {
+    let (actor_bytes, actor_hex) = match parse_actor(&actor_arg) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return Ok(1);
+        }
+    };
+
+    let db = connect_db().await?;
+    let tenant = resolve_admin_tenant(&db).await?;
+
+    let count = db
+        .revoke_all_tokens(tenant.community(), &actor_bytes, &actor_bytes)
+        .await?;
+    println!("revoked {count} active key(s) for {actor_hex}");
+    Ok(0)
+}
+
+async fn cmd_list_keys(actor_arg: String) -> Result<i32> {
+    let (actor_bytes, actor_hex) = match parse_actor(&actor_arg) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return Ok(1);
+        }
+    };
+
+    let db = connect_db().await?;
+    let tenant = resolve_admin_tenant(&db).await?;
+
+    let records = db
+        .list_tokens_by_owner(tenant.community(), &actor_bytes)
+        .await?;
+
+    if records.is_empty() {
+        println!("(no API keys for {actor_hex})");
+        return Ok(0);
+    }
+
+    println!("API keys for {actor_hex} ({} total):", records.len());
+    for r in &records {
+        let channels = match &r.channel_ids {
+            None => "(all)".to_string(),
+            Some(ids) if ids.is_empty() => "(all)".to_string(),
+            Some(ids) => ids
+                .iter()
+                .map(Uuid::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        };
+        // token_hash is intentionally never printed.
+        println!();
+        println!("  id:        {}", r.id);
+        println!("  name:      {}", r.name);
+        println!("  scopes:    {}", r.scopes.join(", "));
+        println!("  channels:  {channels}");
+        println!("  created:   {}", fmt_ts(r.created_at));
+        println!("  expires:   {}", fmt_opt_ts(r.expires_at));
+        println!("  last_used: {}", fmt_opt_ts(r.last_used_at));
+        println!(
+            "  status:    {}",
+            match r.revoked_at {
+                Some(t) => format!("revoked {}", fmt_ts(t)),
+                None => "active".to_string(),
+            }
+        );
+    }
+    Ok(0)
+}
+
+async fn cmd_rotate_key(actor_arg: String, id: Uuid) -> Result<i32> {
+    let (actor_bytes, actor_hex) = match parse_actor(&actor_arg) {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return Ok(1);
+        }
+    };
+
+    let db = connect_db().await?;
+    let tenant = resolve_admin_tenant(&db).await?;
+
+    // Look up the existing key so the replacement inherits its scopes,
+    // channel restriction, name, and expiry.
+    let records = db
+        .list_tokens_by_owner(tenant.community(), &actor_bytes)
+        .await?;
+    let existing = match records.into_iter().find(|r| r.id == id) {
+        Some(r) => r,
+        None => {
+            eprintln!("error: no key {id} owned by {actor_hex}");
+            return Ok(2);
+        }
+    };
+
+    // Revoke the old key (idempotent — already-revoked returns false, which is
+    // fine for a re-key).
+    let _ = db
+        .revoke_token(tenant.community(), id, &actor_bytes, &actor_bytes)
+        .await?;
+
+    let channel_ids: Option<&[Uuid]> = existing.channel_ids.as_deref();
+    let (token, hash) = apikey::generate_token();
+
+    let new_id = match db
+        .create_api_token(
+            tenant.community(),
+            &hash,
+            &actor_bytes,
+            &existing.name,
+            &existing.scopes,
+            channel_ids,
+            existing.expires_at,
+        )
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!(
+                "error: old key {id} revoked but replacement mint failed: {e}\n\
+                 (re-run issue-key to mint a fresh key for this actor)"
+            );
+            return Ok(5);
+        }
+    };
+
+    print!(
+        "{}",
+        apikey::format_issued_token(
+            "rotated",
+            &token,
+            new_id,
+            &actor_hex,
+            &existing.scopes,
+            channel_ids,
+            existing.expires_at,
+        )
+    );
+    Ok(0)
+}
+
+/// Format a required timestamp as RFC3339 (UTC, second precision).
+fn fmt_ts(ts: chrono::DateTime<chrono::Utc>) -> String {
+    ts.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+}
+
+/// Format an optional timestamp; `None` renders as `-`.
+fn fmt_opt_ts(ts: Option<chrono::DateTime<chrono::Utc>>) -> String {
+    ts.map(fmt_ts).unwrap_or_else(|| "-".to_string())
 }
 
 async fn cmd_add_member(pubkey_arg: String, role: String) -> Result<i32> {
