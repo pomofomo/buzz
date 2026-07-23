@@ -30,7 +30,7 @@ class CommunityListNotifier extends AsyncNotifier<List<Community>> {
       final existing = current[existingIndex];
       final updated = existing.copyWith(
         pubkey: community.pubkey,
-        nsec: community.nsec,
+        apiKey: community.apiKey,
       );
       await storage.save(updated);
       final updatedList = [...current];

@@ -6,7 +6,7 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import 'features/channels/unread_badge/unread_badge_provider.dart';
 import 'features/home/home_page.dart';
-import 'features/pairing/pairing_page.dart';
+import 'features/onboarding/sign_in_page.dart';
 import 'features/channels/agent_activity/observer_subscription.dart';
 import 'features/channels/deep_link_dispatcher.dart';
 import 'features/profile/user_status_cache_provider.dart';
@@ -70,14 +70,14 @@ class App extends HookConsumerWidget {
       themeMode: effectiveMode,
       home: authState.when(
         loading: () => const _SplashScreen(),
-        error: (_, _) => const PairingPage(),
+        error: (_, _) => const SignInPage(),
         data: (state) => switch (state.status) {
           AuthStatus.authenticated => const DeepLinkDispatcher(
             child: HomePage(),
           ),
           _ => const DeepLinkDispatcher(
             dispatchMessageLinks: false,
-            child: PairingPage(),
+            child: SignInPage(),
           ),
         },
       ),

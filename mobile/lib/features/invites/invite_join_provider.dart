@@ -2,23 +2,15 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 import 'package:hooks_riverpod/hooks_riverpod.dart';
-import 'package:nostr/nostr.dart' as nostr;
 
 import '../../shared/auth/auth.dart';
 import '../../shared/deeplink/deep_link.dart';
-import '../../shared/relay/relay_session.dart';
 
 final inviteJoinHttpClientProvider = Provider<http.Client>((ref) {
   final client = http.Client();
   ref.onDispose(client.close);
   return client;
 });
-
-final inviteKeyGeneratorProvider = Provider<InviteKeyGenerator>((ref) {
-  return () => nostr.Keys.generate();
-});
-
-typedef InviteKeyGenerator = nostr.Keys Function();
 
 enum InviteJoinStatus {
   idle,
@@ -115,7 +107,9 @@ class InviteJoinNotifier extends Notifier<InviteJoinState> {
         return;
       }
 
-      final keys = ref.read(inviteKeyGeneratorProvider)();
+      // The claim endpoint is unauthenticated — claiming an invite is how the
+      // caller obtains an API key. The relay issues and returns the key (and
+      // the actor id it minted) in the response body.
       final body = jsonEncode({
         'code': invite.code,
         if (invite.policyReceipt != null)
@@ -126,15 +120,7 @@ class InviteJoinNotifier extends Notifier<InviteJoinState> {
           .read(inviteJoinHttpClientProvider)
           .post(
             Uri.parse(url),
-            headers: {
-              'Authorization': buildNip98AuthHeader(
-                method: 'POST',
-                url: url,
-                bodyBytes: utf8.encode(body),
-                nsec: keys.nsec,
-              ),
-              'Content-Type': 'application/json',
-            },
+            headers: {'Content-Type': 'application/json'},
             body: body,
           );
       final decoded = jsonDecode(response.body.isEmpty ? '{}' : response.body);
@@ -149,11 +135,19 @@ class InviteJoinNotifier extends Notifier<InviteJoinState> {
       }
       final claim = Map<String, dynamic>.from(decoded);
 
+      final apiKey = _stringField(claim, const ['api_key', 'apiKey', 'token', 'key']);
+      if (apiKey == null || apiKey.isEmpty) {
+        throw const InviteClaimException(
+          'Invite claim did not return an API key.',
+        );
+      }
+      final actor = _stringField(claim, const ['pubkey', 'actor', 'actor_id']);
+
       final community = Community.create(
         name: _communityNameFromClaim(claim, invite.relayUrl),
         relayUrl: invite.relayUrl,
-        pubkey: keys.public,
-        nsec: keys.nsec,
+        pubkey: actor,
+        apiKey: apiKey,
       );
       await ref
           .read(authProvider.notifier)
@@ -247,6 +241,14 @@ String _claimUrlFromRelay(String relayUrl) {
     port: uri.hasPort ? uri.port : null,
     path: '/api/invites/claim',
   ).toString();
+}
+
+String? _stringField(Map<String, dynamic> claim, List<String> keys) {
+  for (final key in keys) {
+    final value = claim[key];
+    if (value is String && value.trim().isNotEmpty) return value.trim();
+  }
+  return null;
 }
 
 String _communityNameFromClaim(Map<String, dynamic> claim, String relayUrl) {

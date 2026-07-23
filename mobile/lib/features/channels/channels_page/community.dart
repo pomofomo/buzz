@@ -59,7 +59,7 @@ class _CommunitySwitcherSheet extends ConsumerWidget {
                       builder: (dialogContext) => AlertDialog(
                         title: const Text('Remove Community'),
                         content: Text(
-                          'Remove "${community.name}"? You can re-pair later.',
+                          'Remove "${community.name}"? You can rejoin later.',
                         ),
                         actions: [
                           TextButton(
@@ -98,11 +98,10 @@ class _CommunitySwitcherSheet extends ConsumerWidget {
                 title: const Text('Add Community'),
                 onTap: () {
                   final nav = Navigator.of(context, rootNavigator: true);
-                  ref.read(pairingProvider.notifier).reset();
                   Navigator.of(context).pop();
                   nav.push(
                     MaterialPageRoute<void>(
-                      builder: (_) => const PairingPage(addingCommunity: true),
+                      builder: (_) => const SignInPage(addingCommunity: true),
                     ),
                   );
                 },

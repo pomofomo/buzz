@@ -90,8 +90,7 @@ class DirectoryUser {
 }
 
 final currentPubkeyProvider = Provider<String?>((ref) {
-  // Prefer the explicitly-derived pubkey from nsec — this is the signing
-  // identity used for events.
+  // Prefer the configured actor id — this is the identity used for events.
   final myPk = ref.watch(myPubkeyProvider);
   if (myPk != null) return myPk.toLowerCase();
 
@@ -501,7 +500,7 @@ final channelActionsProvider = Provider<ChannelActions>((ref) {
     session: session,
     signedEventRelay: SignedEventRelay(
       session: session,
-      nsec: relayConfig.nsec,
+      actorPubkey: relayConfig.actorPubkey,
     ),
     currentPubkey: currentPubkey,
   );

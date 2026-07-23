@@ -2,7 +2,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
-import 'package:nostr/nostr.dart' as nostr;
 import 'package:package_info_plus/package_info_plus.dart';
 
 import '../../shared/auth/auth.dart';
@@ -115,19 +114,15 @@ class SettingsPage extends HookConsumerWidget {
                       title: 'Connected to',
                       subtitle: config.baseUrl,
                     ),
-                    if (config.nsec != null && config.nsec!.isNotEmpty)
+                    if (config.actorPubkey != null &&
+                        config.actorPubkey!.isNotEmpty)
                       Builder(
                         builder: (context) {
-                          final privHex = nostr.Nip19.decode(
-                            payload: config.nsec!,
-                          ).data;
-                          final pubkey = privHex.isNotEmpty
-                              ? nostr.Keys(privHex).public
-                              : 'unknown';
+                          final actor = config.actorPubkey!;
                           return AppListRow(
                             icon: LucideIcons.key,
-                            title: 'Identity (pubkey)',
-                            subtitle: pubkey,
+                            title: 'Identity (actor id)',
+                            subtitle: actor,
                             subtitleStyle: context.textTheme.bodySmall
                                 ?.copyWith(
                                   color: context.colors.onSurfaceVariant,
@@ -140,8 +135,8 @@ class SettingsPage extends HookConsumerWidget {
                               onPressed: () async {
                                 await copyToClipboard(
                                   context,
-                                  pubkey,
-                                  message: 'Pubkey copied',
+                                  actor,
+                                  message: 'Actor id copied',
                                 );
                               },
                             ),
@@ -195,7 +190,7 @@ class SettingsPage extends HookConsumerWidget {
         title: const Text('Remove Community'),
         content: const Text(
           'This will disconnect this community. You will need '
-          'to scan a new pairing code to reconnect.',
+          'to enter a new API key to reconnect.',
         ),
         actions: [
           TextButton(
@@ -206,7 +201,7 @@ class SettingsPage extends HookConsumerWidget {
             onPressed: () {
               Navigator.of(ctx).pop(); // close dialog
               // Pop all pushed routes back to root so MaterialApp.home
-              // rebuilds to PairingPage when auth state changes.
+              // rebuilds to SignInPage when auth state changes.
               Navigator.of(context).popUntil((route) => route.isFirst);
               ref.read(authProvider.notifier).signOut();
             },

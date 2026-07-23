@@ -5,8 +5,8 @@ import '../channels/channel_management_provider.dart';
 import '../profile/user_cache_provider.dart';
 import '../profile/user_profile.dart';
 
-/// Sends messages by signing an event with the user's nsec and publishing it
-/// over the relay's NIP-42-authenticated WebSocket session.
+/// Sends messages by publishing an unsigned intent over the relay's
+/// bearer-authenticated WebSocket session (the relay authors the row).
 class SendMessage {
   final SignedEventRelay _signedEventRelay;
   final Future<List<ChannelMember>> Function(String channelId) _fetchMembers;
@@ -141,7 +141,7 @@ final sendMessageProvider = Provider<SendMessage>((ref) {
   return SendMessage(
     signedEventRelay: SignedEventRelay(
       session: ref.read(relaySessionProvider.notifier),
-      nsec: config.nsec,
+      actorPubkey: config.actorPubkey,
     ),
     fetchMembers: (channelId) =>
         ref.read(channelMembersProvider(channelId).future),
