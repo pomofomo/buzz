@@ -64,6 +64,46 @@ impl NostrWsConnection {
         })
     }
 
+    /// Connects to the relay at `url` presenting an `Authorization: Bearer
+    /// <token>` header on the WebSocket upgrade request (API-key auth mode).
+    ///
+    /// This mirrors the relay's `apikey`-mode doorway: the bearer token is
+    /// resolved at connect (`crates/buzz-relay/src/router.rs` extracts it from
+    /// the `Authorization` header and `connection.rs::authenticate_ws_bearer`
+    /// validates it via [`buzz_auth::AuthService::verify_api_key`]). There is
+    /// **no** NIP-42 challenge round-trip — a successful upgrade means the
+    /// connection is already authenticated, so no [`Self::authenticate`] call
+    /// follows. A rejected token closes the socket at upgrade time.
+    pub async fn connect_with_bearer(url: &str, token: &str) -> Result<Self, WsClientError> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::http::header::{HeaderValue, AUTHORIZATION};
+
+        let parsed = url
+            .parse::<url::Url>()
+            .map_err(|e| WsClientError::Url(e.to_string()))?;
+
+        let mut request = parsed
+            .as_str()
+            .into_client_request()
+            .map_err(WsClientError::WebSocket)?;
+        let value = HeaderValue::from_str(&format!("Bearer {token}"))
+            .map_err(|e| WsClientError::Url(format!("invalid bearer token header: {e}")))?;
+        request.headers_mut().insert(AUTHORIZATION, value);
+
+        let (ws, _response) = connect_async(request)
+            .await
+            .map_err(WsClientError::WebSocket)?;
+
+        debug!("connected to relay at {url} with bearer auth");
+
+        Ok(Self {
+            ws,
+            buffer: VecDeque::new(),
+            pending_challenge: None,
+            relay_url: url.to_string(),
+        })
+    }
+
     /// Performs NIP-42 authentication using `keys` against the connected relay.
     ///
     /// Pass `auth_tag` to include a NIP-OA authorization tag in the AUTH event.

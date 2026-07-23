@@ -1205,7 +1205,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "buzz-auth",
  "buzz-core",
+ "buzz-db",
  "buzz-sdk",
  "buzz-ws-client",
  "chrono",

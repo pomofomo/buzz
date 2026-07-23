@@ -211,10 +211,11 @@ mod row_zero_host_binding {
     ///     (Mari, `buzz-db`) asserts **coexistence**: a channel UUID that exists
     ///     in *both* A and B; a post in A's instance never touches B's. Two
     ///     legitimate channels, non-interference.
-    ///   * [`super::api_tokens_nip98_replay`] / Sami's
-    ///     `verify_nip42_rejects_event_signed_for_wrong_communitys_host`
-    ///     (`nip42_host_binding_live.rs`) assert the **AUTH `relay` tag** and
-    ///     **token / NIP-98 `u`-host** override signals on their own paths.
+    ///   * [`super::api_tokens_nip98_replay`] asserts the **token / NIP-98
+    ///     `u`-host** override signal on its own path. (The former NIP-42 AUTH
+    ///     `relay`-tag host-binding sibling, `nip42_host_binding_live.rs`, was
+    ///     retired in the API-key cutover — Lane L — along with the NIP-42
+    ///     challenge doorway it exercised; bearer auth carries no `relay` tag.)
     ///
     /// row_zero (b) asserts the **`#h` override-attempt**: a channel that exists
     /// *only in B*; an A connection `#h`-tagging it is **rejected** — the host

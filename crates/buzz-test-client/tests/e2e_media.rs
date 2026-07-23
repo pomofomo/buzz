@@ -3,6 +3,19 @@
 //! Requires: relay running at localhost:3000, MinIO running at localhost:9000.
 //! All tests are `#[ignore]` so they don't run in CI by default.
 //!
+//! ## Auth mode
+//!
+//! The `sign_blossom_auth` / `blossom_auth_header` tests exercise the **nostr**
+//! doorway: a signed kind:24242 Blossom auth event whose `x` tag binds the body
+//! hash (`Authorization: Nostr <base64(event)>`). They are valid only under
+//! `BUZZ_AUTH_MODE=nostr` and are retained for the dual-run migration window.
+//!
+//! Under `BUZZ_AUTH_MODE=apikey` the media endpoints authenticate a bearer token
+//! carrying `files:{read,write}` instead (Lane E) — see
+//! `bearer_upload_and_get` below, which uses
+//! [`buzz_test_client::bearer_auth_header`]. Set `BUZZ_API_KEY` to a provisioned
+//! `files:write` key to run it.
+//!
 //! # Running
 //!
 //! ```text
@@ -373,4 +386,55 @@ async fn test_upload_real_image() {
     );
 
     println!("✅ Real image upload round-trip passed");
+}
+
+// ---------------------------------------------------------------------------
+// apikey mode: bearer media upload/download (Lane E).
+//
+// The bearer counterpart to the Blossom kind:24242 tests above. Under
+// `BUZZ_AUTH_MODE=apikey` the relay authenticates `Authorization: Bearer <token>`
+// with a `files:write` scope and hashes the request body directly (the `x`-tag
+// body-hash binding is replaced by direct body hashing). Ignored: requires a
+// relay in apikey mode and a provisioned `files:write` key in `BUZZ_API_KEY`.
+// ---------------------------------------------------------------------------
+
+/// Upload a tiny JPEG with a bearer `files:write` key, then GET it back.
+#[tokio::test]
+#[ignore = "requires relay with BUZZ_AUTH_MODE=apikey and a files:write BUZZ_API_KEY"]
+async fn bearer_upload_and_get() {
+    let token = std::env::var("BUZZ_API_KEY").expect("set BUZZ_API_KEY to a files:write key");
+    let client = http_client();
+    let jpeg = tiny_jpeg();
+    let sha256 = hex::encode(Sha256::digest(&jpeg));
+
+    let resp = client
+        .put(format!("{}/upload", relay_http_url()))
+        .header(
+            "Authorization",
+            buzz_test_client::bearer_auth_header(&token),
+        )
+        .header("Content-Type", "image/jpeg")
+        .header("X-SHA-256", &sha256)
+        .body(jpeg.clone())
+        .send()
+        .await
+        .expect("bearer upload PUT failed");
+    assert_eq!(resp.status(), 200, "bearer upload should succeed");
+
+    let descriptor: serde_json::Value = resp.json().await.expect("BlobDescriptor JSON");
+    assert_eq!(
+        descriptor["sha256"].as_str().unwrap(),
+        sha256,
+        "sha256 must match"
+    );
+
+    // GET the bytes back and verify they round-trip.
+    let get_url = descriptor["url"].as_str().unwrap();
+    let get_resp = client.get(get_url).send().await.expect("GET failed");
+    assert_eq!(get_resp.status(), 200);
+    assert_eq!(
+        get_resp.bytes().await.unwrap().as_ref(),
+        jpeg.as_slice(),
+        "GET must return original bytes"
+    );
 }
