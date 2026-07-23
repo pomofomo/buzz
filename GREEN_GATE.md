@@ -33,7 +33,14 @@ cargo build --workspace                          # compiles
 cargo test -p buzz-core -p buzz-auth --lib       # unit tests, no infra
 cargo test -p buzz-db --lib                      # unit tests (see infra note)
 cargo test -p buzz-conformance                   # multi-tenant conformance
+cargo test -p buzz-push-gateway                  # infra-free gateway tests
 ```
+
+> The Justfile `test-unit` recipe uses `cargo nextest` (not installed in this
+> sandbox — use plain `cargo test`) and runs exactly these five test groups:
+> `buzz-core`+`buzz-auth` `--lib`, `buzz-db --lib`, `buzz-conformance`, and
+> `buzz-push-gateway`. Postgres-backed `buzz-db` tests are `#[ignore]`d by
+> design, so `--lib` runs only the infra-free set.
 
 ### Desktop Tauri crate (separate manifest, excluded from root workspace)
 
