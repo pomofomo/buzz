@@ -560,7 +560,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 24);
+        assert_eq!(migrations.len(), 25);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -879,6 +879,16 @@ mod tests {
             .to_lowercase()
             .contains("for update"));
         assert!(ttl_shared.contains("NEW.kind <> 9007"));
+
+        // Lane A (Nostr -> API-key refactor): `events.sig` becomes optional so
+        // server-authored rows need not carry a signature. Additive migration —
+        // never folded into 0001; the `pubkey` reinterpretation as an opaque
+        // actor id is documentation-only (no DDL).
+        assert_eq!(migrations[24].version, 25);
+        assert!(migrations[24]
+            .sql
+            .as_str()
+            .contains("ALTER TABLE events ALTER COLUMN sig DROP NOT NULL"));
     }
 
     #[test]

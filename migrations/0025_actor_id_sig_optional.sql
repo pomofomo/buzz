@@ -1,0 +1,32 @@
+-- Lane A (identity & schema foundation) of the Nostr -> API-key refactor.
+-- See REFACTOR.md §5 "Lane A". This migration is additive and back-compat:
+-- it changes no existing row data and preserves nostr-mode behavior.
+--
+-- 1. Identity column is now an opaque 32-byte actor id.
+--    The `pubkey` / `owner_pubkey` / `actor_pubkey` BYTEA columns across the
+--    schema (~15 tables: events, users, moderation, push leases, api_tokens,
+--    audit_log, ...) no longer denote a Nostr public key specifically. They
+--    hold an opaque 32-byte *actor identifier*:
+--      * For legacy rows the actor id equals the historical Nostr pubkey, so
+--        existing attribution is preserved with no data change.
+--      * For server-authored rows (API-key auth mode) it is the resolved
+--        principal's actor id.
+--    The columns are deliberately NOT renamed (avoids churning ~15 tables and
+--    their indexes — see REFACTOR.md decision #2). The existing
+--    `CHECK (LENGTH(...) = 32)` constraints are intentionally retained: an
+--    actor id is exactly 32 bytes, so it fits the current column shape with no
+--    constraint churn. Treat these columns as opaque identity bytes.
+--    This step is documentation only — no DDL is required to reinterpret the
+--    semantics of the existing bytes.
+--
+-- 2. `events.sig` becomes optional.
+--    Nostr-era rows carry a real 64-byte Schnorr signature. Server-authored
+--    rows (written after the auth gate rather than client-signed) may have no
+--    signature. The read/rehydration path never verifies `sig` (a NULL/empty
+--    value rehydrates to an all-zero placeholder for the wire type), so the
+--    NOT NULL requirement can be dropped. Existing rows keep their signature.
+--
+--    `events` is RANGE-partitioned by `created_at`; dropping NOT NULL on the
+--    partitioned parent propagates to all existing and future partitions.
+
+ALTER TABLE events ALTER COLUMN sig DROP NOT NULL;

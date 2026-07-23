@@ -1235,7 +1235,9 @@ fn reminder_to_event(reminder: &buzz_db::event::DueReminder) -> nostr::Event {
         "kind": reminder.kind as u16,
         "tags": reminder.tags,
         "content": reminder.content,
-        "sig": hex::encode(&reminder.sig),
+        // `sig` is nullable (server-authored rows). An empty sig rehydrates to
+        // an all-zero placeholder so the wire type still constructs; never verified.
+        "sig": buzz_db::event::rehydrate_sig_hex(Some(reminder.sig.as_slice())),
     });
 
     serde_json::from_value(event_json).expect("valid event JSON from DB row")

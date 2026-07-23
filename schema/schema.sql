@@ -213,7 +213,10 @@ CREATE TABLE events (
              ELSE to_tsvector('simple', content)
         END
     ) STORED,
-    sig         BYTEA NOT NULL,
+    -- Nullable: legacy Nostr-era rows carry a real 64-byte Schnorr signature;
+    -- server-authored rows (API-key auth mode) may store NULL/empty. The read
+    -- path never verifies this column. See migration 0025.
+    sig         BYTEA,
     received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     channel_id  UUID,
     deleted_at  TIMESTAMPTZ,
