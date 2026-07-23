@@ -892,10 +892,25 @@ async fn submit_event_authed(
     // Scopes come from the resolved principal: `all_known` in nostr mode
     // (unchanged), or the bearer token's stored scopes in apikey mode. The
     // downstream `required_scope_for_kind` check enforces them per kind.
-    let auth = IngestAuth::Http {
-        pubkey,
-        scopes,
-        auth_method: crate::handlers::ingest::HttpAuthMethod::Nip98,
+    //
+    // In apikey mode the bearer principal server-authors the row: the client
+    // POSTs an UNSIGNED intent envelope and `ingest_event` stamps the actor/id/
+    // sig (via `IngestAuth::ApiKey`). In nostr mode the NIP-98 signed path is
+    // unchanged. Per-key `channel_ids` narrowing is not surfaced on the HTTP
+    // write path yet (`resolve_bridge_principal` does not return it); channel
+    // access still runs through the `check_channel_membership` gate downstream.
+    let auth = if state.auth.auth_mode().is_apikey() {
+        IngestAuth::ApiKey {
+            actor: pubkey,
+            scopes,
+            channel_ids: None,
+        }
+    } else {
+        IngestAuth::Http {
+            pubkey,
+            scopes,
+            auth_method: crate::handlers::ingest::HttpAuthMethod::Nip98,
+        }
     };
 
     match crate::handlers::ingest::ingest_event(state, tenant, event, auth).await {

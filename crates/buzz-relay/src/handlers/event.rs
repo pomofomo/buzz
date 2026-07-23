@@ -608,7 +608,7 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
     )
     .increment(1);
 
-    let (conn_id, pubkey_bytes, auth_pubkey, scopes, channel_ids) = {
+    let (conn_id, pubkey_bytes, auth_pubkey, scopes, channel_ids, is_apikey) = {
         let auth = conn.auth_state.read().await;
         match &*auth {
             AuthState::Authenticated(ctx) => (
@@ -617,6 +617,7 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
                 ctx.pubkey,
                 ctx.scopes.clone(),
                 ctx.channel_ids.clone(),
+                ctx.auth_method == buzz_auth::AuthMethod::ApiKey,
             ),
             _ => {
                 reject("auth");
@@ -633,8 +634,14 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
     // Must run before both ephemeral and persistent branches. Persistent
     // events get a second check inside ingest_event() (step 3), but
     // ephemeral events bypass the pipeline entirely.
+    //
+    // In `apikey` mode the client submits an UNSIGNED intent whose `pubkey` is a
+    // placeholder, and the relay server-authors the row (stamping the actor) in
+    // `ingest_event`. Enforcing author == actor here would reject every intent
+    // before it reaches the authoring step, so this equality is `nostr`-mode
+    // only. (The persistent path is re-guarded inside `ingest_event`.)
     let is_gift_wrap = kind_u32 == KIND_GIFT_WRAP;
-    if event.pubkey != auth_pubkey && !is_gift_wrap {
+    if !is_apikey && event.pubkey != auth_pubkey && !is_gift_wrap {
         reject("invalid");
         conn.send(RelayMessage::ok(
             &event_id_hex,
@@ -695,11 +702,21 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
         return;
     }
 
-    let ingest_auth = IngestAuth::Nip42 {
-        pubkey: auth_pubkey,
-        scopes,
-        channel_ids,
-        conn_id,
+    // `apikey` mode: build the server-authoring auth context so `ingest_event`
+    // stamps the actor/id/sig. `nostr` mode: the existing NIP-42 (signed) path.
+    let ingest_auth = if is_apikey {
+        IngestAuth::ApiKey {
+            actor: auth_pubkey,
+            scopes,
+            channel_ids,
+        }
+    } else {
+        IngestAuth::Nip42 {
+            pubkey: auth_pubkey,
+            scopes,
+            channel_ids,
+            conn_id,
+        }
     };
 
     match super::ingest::ingest_event(&state, &conn.tenant, event, ingest_auth).await {
