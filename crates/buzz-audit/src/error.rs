@@ -38,6 +38,16 @@ pub enum AuditError {
     /// A JSON serialization error occurred (e.g. while canonicalising `detail`).
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
+
+    /// External WORM/S3 anchoring failed (client construction or object PUT).
+    ///
+    /// Operator-internal, like every variant here. The message carries only the
+    /// underlying storage/client error string — never a `community_id`, so an
+    /// anchor failure for one tenant cannot name another. (The anchor *payload*
+    /// deliberately contains the community id; that is the exported artifact,
+    /// not this diagnostic.)
+    #[error("audit anchor error: {0}")]
+    Anchor(String),
 }
 
 #[cfg(test)]

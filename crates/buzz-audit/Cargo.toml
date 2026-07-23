@@ -20,3 +20,6 @@ thiserror   = { workspace = true }
 sha2         = { workspace = true }
 hex          = { workspace = true }
 futures-util = { workspace = true }
+# External WORM anchoring (Lane F). Same S3 client + feature set as buzz-media
+# so the relay links one rust-s3 build.
+s3 = { version = "0.37", package = "rust-s3", default-features = false, features = ["tokio-rustls-tls", "fail-on-err", "tags"] }

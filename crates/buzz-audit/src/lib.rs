@@ -19,6 +19,9 @@
 
 /// Audit action types recorded in the log.
 pub mod action;
+/// External WORM anchoring of chain heads to S3 Object Lock (additive, off by
+/// default).
+pub mod anchor;
 /// Audit log entry types (stored and input).
 pub mod entry;
 /// Error types for audit operations.
@@ -29,6 +32,7 @@ pub mod hash;
 pub mod service;
 
 pub use action::AuditAction;
+pub use anchor::{spawn_anchor_worker, AnchorConfig, AnchorPayload, AuditAnchor};
 pub use entry::{AuditEntry, NewAuditEntry};
 pub use error::AuditError;
 pub use hash::{compute_hash, GENESIS_HASH};
