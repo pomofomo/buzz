@@ -172,6 +172,30 @@ fn json_to_string(v: &JsonValue) -> String {
     }
 }
 
+/// Returns `true` when actors are opaque API-key strings (apikey mode) rather
+/// than Nostr pubkeys (nostr mode).
+///
+/// Engaged when `BUZZ_API_KEY` is present or `BUZZ_AUTH_MODE` names the apikey
+/// doorway (`apikey` / `api_key` / `api-key`). In apikey mode the `npub` display
+/// filter is a no-op — an opaque actor id has no bech32 encoding.
+fn apikey_actor_mode() -> bool {
+    if std::env::var("BUZZ_API_KEY")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    std::env::var("BUZZ_AUTH_MODE")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "apikey" | "api_key" | "api-key"
+            )
+        })
+        .unwrap_or(false)
+}
+
 /// Apply a filter expression to a resolved value.
 fn apply_filter(value: String, filter: &str) -> Result<String, WorkflowError> {
     let filter = filter.trim();
@@ -187,8 +211,14 @@ fn apply_filter(value: String, filter: &str) -> Result<String, WorkflowError> {
         return Ok(truncated);
     }
 
-    // `npub` (alias `truncate_pubkey`): full bech32 npub — truncated prefixes are grindable.
+    // `npub` (alias `truncate_pubkey`): full bech32 npub — truncated prefixes
+    // are grindable. Retained for template compatibility, but a no-op in apikey
+    // mode: actors are opaque strings there, not Nostr pubkeys, so there is no
+    // bech32 encoding to apply and the value passes through unchanged.
     if filter == "npub" || filter == "truncate_pubkey" {
+        if apikey_actor_mode() {
+            return Ok(value);
+        }
         if let Ok(pk) = nostr::PublicKey::from_hex(&value) {
             return Ok(pk.to_bech32().unwrap_or(value));
         }
