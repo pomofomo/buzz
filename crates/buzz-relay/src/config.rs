@@ -569,8 +569,20 @@ impl Config {
             ));
         }
 
+        let auth_mode = match std::env::var("BUZZ_AUTH_MODE") {
+            Ok(raw) if !raw.trim().is_empty() => {
+                buzz_auth::AuthMode::parse(&raw).ok_or_else(|| {
+                    ConfigError::InvalidValue(format!(
+                        "BUZZ_AUTH_MODE must be 'nostr' or 'apikey', got '{raw}'"
+                    ))
+                })?
+            }
+            _ => buzz_auth::AuthMode::default(),
+        };
+
         let auth = buzz_auth::AuthConfig {
             rate_limits: rate_limit_config_from_env()?,
+            auth_mode,
         };
 
         if !require_auth_token {

@@ -11,9 +11,14 @@ description = "Authentication and authorization for Buzz"
 test-utils = []
 dev = []
 
+[dev-dependencies]
+sqlx = { workspace = true }
+
 [dependencies]
 buzz-core = { workspace = true }
+buzz-db      = { workspace = true }
 nostr        = { workspace = true }
+chrono       = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
 tokio        = { workspace = true }

@@ -127,6 +127,67 @@ pub(crate) fn verify_bridge_auth_with_options(
     Err(api_error(StatusCode::UNAUTHORIZED, "missing Nostr auth"))
 }
 
+/// Resolve the HTTP bridge principal according to the active [`buzz_auth::AuthMode`].
+///
+/// - **nostr mode:** delegates to [`verify_bridge_auth`] (NIP-98, or the dev
+///   `X-Pubkey` fallback) and grants [`buzz_auth::Scope::all_known`] — behaviour
+///   unchanged from before this refactor.
+/// - **apikey mode:** validates `Authorization: Bearer <token>` via
+///   [`buzz_auth::AuthService::verify_api_key`] and returns the token's actor id
+///   plus its **stored scopes**. The event id is zeroed — a bearer token carries
+///   no per-request nonce, so the NIP-98 replay guard is skipped (it no-ops on a
+///   zero id).
+///
+/// Returned scopes flow into the write-path scope check (`required_scope_for_kind`)
+/// and the read-path action gate, so an over-broad request is denied by scope.
+pub(crate) async fn resolve_bridge_principal(
+    state: &AppState,
+    tenant: &TenantContext,
+    headers: &HeaderMap,
+    method: &str,
+    url: &str,
+    body: Option<&[u8]>,
+) -> Result<(nostr::PublicKey, [u8; 32], Vec<buzz_auth::Scope>), (StatusCode, Json<Value>)> {
+    if state.auth.auth_mode().is_apikey() {
+        let token = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                api_error(
+                    StatusCode::UNAUTHORIZED,
+                    "missing Authorization: Bearer token",
+                )
+            })?;
+        let ctx = state
+            .auth
+            .verify_api_key(token, tenant.community(), &state.db)
+            .await
+            .map_err(|_| api_error(StatusCode::UNAUTHORIZED, "invalid bearer token"))?;
+        Ok((ctx.pubkey, [0u8; 32], ctx.scopes))
+    } else {
+        let (pubkey, event_id_bytes) =
+            verify_bridge_auth(headers, method, url, body, state.config.require_auth_token)?;
+        Ok((pubkey, event_id_bytes, buzz_auth::Scope::all_known()))
+    }
+}
+
+/// Action-level read scope gate for the HTTP bridge, mirroring the WS REQ gate
+/// (`handlers::req`). A no-op under [`buzz_auth::Scope::all_known`] (nostr mode);
+/// in apikey mode a token lacking `messages:read` is denied. The empty-scope
+/// bypass matches the WS path so a principal with no scopes is not blocked here.
+fn enforce_read_scope(scopes: &[buzz_auth::Scope]) -> Result<(), (StatusCode, Json<Value>)> {
+    if !scopes.is_empty() && !scopes.contains(&buzz_auth::Scope::MessagesRead) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "restricted: token lacks messages:read scope",
+        ));
+    }
+    Ok(())
+}
+
 /// Check NIP-98 replay and record the event ID atomically.
 ///
 /// The correctness boundary is the shared, community-scoped Redis seen-set on
@@ -633,21 +694,24 @@ pub async fn submit_event(
         })?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/events");
-    let (pubkey, event_id_bytes) = verify_bridge_auth(
-        &headers,
-        "POST",
-        &url,
-        Some(&body),
-        state.config.require_auth_token,
-    )?;
+    let (pubkey, event_id_bytes, scopes) =
+        resolve_bridge_principal(&state, &tenant, &headers, "POST", &url, Some(&body)).await?;
     let pubkey_hex = pubkey.to_hex();
 
     // Everything after auth — admission, replay, membership, parse, ingest —
     // runs inside the helper.  The thin wrapper here owns the single terminal
     // attribution line so it fires for every outcome, including admission/
     // replay/membership failures that previously returned before any log fired.
-    let outcome =
-        submit_event_authed(&state, &tenant, &headers, &body, pubkey, event_id_bytes).await;
+    let outcome = submit_event_authed(
+        &state,
+        &tenant,
+        &headers,
+        &body,
+        pubkey,
+        event_id_bytes,
+        scopes,
+    )
+    .await;
 
     match &outcome {
         SubmitOutcome::Ok { accepted, .. } => {
@@ -754,6 +818,7 @@ async fn submit_event_authed(
     body: &[u8],
     pubkey: nostr::PublicKey,
     event_id_bytes: [u8; 32],
+    scopes: Vec<buzz_auth::Scope>,
 ) -> SubmitOutcome {
     // Admission and replay checks fire before body parse — a 429 or replay
     // reject on a malformed body must still be attributed.
@@ -824,9 +889,12 @@ async fn submit_event_authed(
     }
 
     let kind_u32 = buzz_core::kind::event_kind_u32(&event);
+    // Scopes come from the resolved principal: `all_known` in nostr mode
+    // (unchanged), or the bearer token's stored scopes in apikey mode. The
+    // downstream `required_scope_for_kind` check enforces them per kind.
     let auth = IngestAuth::Http {
         pubkey,
-        scopes: buzz_auth::Scope::all_known(), // Pure Nostr: full scopes, channel access via membership
+        scopes,
         auth_method: crate::handlers::ingest::HttpAuthMethod::Nip98,
     };
 
@@ -901,21 +969,24 @@ pub async fn query_events(
         })?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/query");
-    let (pubkey, event_id_bytes) = verify_bridge_auth(
-        &headers,
-        "POST",
-        &url,
-        Some(&body),
-        state.config.require_auth_token,
-    )?;
+    let (pubkey, event_id_bytes, scopes) =
+        resolve_bridge_principal(&state, &tenant, &headers, "POST", &url, Some(&body)).await?;
     let pubkey_hex = pubkey.to_hex();
 
     // Admission, replay, membership, and filter execution all run inside the
     // helper.  The single terminal attribution line fires here from the Result
     // so every outcome — including admission/replay/membership failures that
     // previously returned before any log — is attributed.
-    let result =
-        query_events_authed(&state, &tenant, &headers, &body, pubkey, event_id_bytes).await;
+    let result = query_events_authed(
+        &state,
+        &tenant,
+        &headers,
+        &body,
+        pubkey,
+        event_id_bytes,
+        &scopes,
+    )
+    .await;
     match &result {
         Ok(Json(Value::Array(events))) => {
             tracing::info!(
@@ -951,7 +1022,9 @@ async fn query_events_authed(
     body: &[u8],
     pubkey: nostr::PublicKey,
     event_id_bytes: [u8; 32],
+    scopes: &[buzz_auth::Scope],
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    enforce_read_scope(scopes)?;
     enforce_http_admission(state, tenant, &pubkey).await?;
     check_nip98_replay(state, tenant, event_id_bytes).await?;
     let pubkey_bytes = pubkey.to_bytes().to_vec();
@@ -1334,21 +1407,24 @@ pub async fn count_events(
         })?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/count");
-    let (pubkey, event_id_bytes) = verify_bridge_auth(
-        &headers,
-        "POST",
-        &url,
-        Some(&body),
-        state.config.require_auth_token,
-    )?;
+    let (pubkey, event_id_bytes, scopes) =
+        resolve_bridge_principal(&state, &tenant, &headers, "POST", &url, Some(&body)).await?;
     let pubkey_hex = pubkey.to_hex();
 
     // Admission, replay, membership, and count execution all run inside the
     // helper.  The single terminal attribution line fires here from the Result
     // so every outcome — including admission/replay/membership failures that
     // previously returned before any log — is attributed.
-    let result =
-        count_events_authed(&state, &tenant, &headers, &body, pubkey, event_id_bytes).await;
+    let result = count_events_authed(
+        &state,
+        &tenant,
+        &headers,
+        &body,
+        pubkey,
+        event_id_bytes,
+        &scopes,
+    )
+    .await;
     match &result {
         Ok(Json(value)) => {
             let count = value.get("count").and_then(Value::as_u64);
@@ -1382,7 +1458,9 @@ async fn count_events_authed(
     body: &[u8],
     pubkey: nostr::PublicKey,
     event_id_bytes: [u8; 32],
+    scopes: &[buzz_auth::Scope],
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    enforce_read_scope(scopes)?;
     enforce_http_admission(state, tenant, &pubkey).await?;
     check_nip98_replay(state, tenant, event_id_bytes).await?;
     let pubkey_bytes = pubkey.to_bytes().to_vec();
@@ -2029,8 +2107,10 @@ async fn authorize_moderation_read(
         _ => path.to_string(),
     };
     let url = nip98_expected_url(&state.config.relay_url, &tenant, &path_with_query);
-    let (pubkey, event_id_bytes) =
-        verify_bridge_auth(headers, "GET", &url, None, state.config.require_auth_token)?;
+    // Moderation reads authorize via `authorize_moderation_action` (moderator
+    // role), not scopes — but authentication still follows the active mode.
+    let (pubkey, event_id_bytes, _scopes) =
+        resolve_bridge_principal(state, &tenant, headers, "GET", &url, None).await?;
     check_nip98_replay(state, &tenant, event_id_bytes).await?;
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 
