@@ -355,7 +355,6 @@ pub fn run() {
         .manage(PendingCommunityDeepLinks::default())
         .manage(BuilderlabSession::default())
         .manage(BuilderlabLogin::default())
-        .manage(commands::pairing::PairingHandle::new())
         .setup(move |app| {
             let app_handle = app.handle().clone();
 
@@ -665,6 +664,11 @@ pub fn run() {
             get_nsec,
             import_identity,
             persist_current_identity,
+            get_auth_mode,
+            get_api_key,
+            has_api_key,
+            set_api_key,
+            clear_api_key,
             get_profile,
             update_profile,
             get_user_profile,
@@ -867,9 +871,6 @@ pub fn run() {
             list_audio_output_devices,
             set_audio_output_device,
             get_audio_output_device,
-            start_pairing,
-            confirm_pairing_sas,
-            cancel_pairing,
             apply_workspace,
             validate_repos_dir,
             get_active_workspace,

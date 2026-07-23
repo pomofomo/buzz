@@ -1,5 +1,4 @@
 import { normalizePubkey } from "@/shared/lib/pubkey";
-import { verifyEvent } from "nostr-tools/pure";
 
 const PUBKEY_HEX_RE = /^[0-9a-f]{64}$/i;
 
@@ -41,14 +40,6 @@ type AuthorResolutionEvent = {
   sig: string;
 };
 
-function hasValidSignature(event: AuthorResolutionEvent) {
-  try {
-    return verifyEvent(event);
-  } catch {
-    return false;
-  }
-}
-
 export function resolveEventAuthorPubkey(input: {
   event: AuthorResolutionEvent;
   preferActorTag?: boolean;
@@ -89,7 +80,11 @@ export function resolveEventAuthorPubkey(input: {
     }
   }
 
-  if (!attributedPubkey || !hasValidSignature(event)) {
+  // Under server-authored rows the relay is the sole author of attributed
+  // events, so the actor/p attribution is authoritative once the event is
+  // stamped by the relay identity (checked above). The former client-side
+  // signature verification is moot (sig is vestigial/empty) and was removed.
+  if (!attributedPubkey) {
     return signerPubkey;
   }
 

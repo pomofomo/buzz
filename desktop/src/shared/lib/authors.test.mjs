@@ -16,7 +16,6 @@ function resolve({
   tags,
   relaySelfPubkey = RELAY,
   preferActorTag = true,
-  tamperAfterSigning = false,
 }) {
   const event = finalizeEvent(
     {
@@ -27,12 +26,9 @@ function resolve({
     },
     signer === "relay" ? RELAY_SECRET : SIGNER_SECRET,
   );
-  const eventToResolve = tamperAfterSigning
-    ? { ...JSON.parse(JSON.stringify(event)), content: "tampered" }
-    : event;
 
   return resolveEventAuthorPubkey({
-    event: eventToResolve,
+    event,
     preferActorTag,
     relaySelfPubkey,
     requireChannelTagForPTags: true,
@@ -113,16 +109,8 @@ test("malformed relay-signed attribution fails closed to the signer", () => {
   );
 });
 
-test("invalid relay event signature fails closed to the signer", () => {
-  assert.equal(
-    resolve({
-      signer: "relay",
-      tags: [
-        ["h", CHANNEL_ID],
-        ["actor", ATTRIBUTED_USER],
-      ],
-      tamperAfterSigning: true,
-    }),
-    RELAY,
-  );
-});
+// Note: the former "invalid relay event signature fails closed" case was
+// removed with the client-side `verifyEvent` guard. Under server-authored
+// rows the `sig` field is vestigial/empty, so attribution trust derives from
+// the relay-identity stamp (checked in resolveEventAuthorPubkey), not a
+// client-side signature verification.

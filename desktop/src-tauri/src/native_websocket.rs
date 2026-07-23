@@ -6,7 +6,11 @@ use tauri::{ipc::Channel, plugin::TauriPlugin, Manager, Runtime};
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::{
     connect_async,
-    tungstenite::protocol::{frame::coding::CloseCode, CloseFrame, Message},
+    tungstenite::{
+        client::IntoClientRequest,
+        http::{header::AUTHORIZATION, HeaderValue},
+        protocol::{frame::coding::CloseCode, CloseFrame, Message},
+    },
 };
 use tokio_util::sync::CancellationToken;
 
@@ -124,12 +128,27 @@ impl WebSocketManager {
 async fn open_connection(
     manager: &WebSocketManager,
     url: &str,
+    authorization: Option<&str>,
     on_message: Channel<serde_json::Value>,
 ) -> Result<Id, String> {
+    // Build the client upgrade request so an `Authorization: Bearer <token>`
+    // header can be attached at connect time. In `apikey` auth mode the relay
+    // authenticates the WebSocket from this header instead of the NIP-42
+    // challenge/response handshake. When no token is supplied the request is
+    // the plain URL upgrade (Nostr doorway).
+    let mut request = url
+        .into_client_request()
+        .map_err(|error| format!("invalid WebSocket request: {error}"))?;
+    if let Some(auth) = authorization {
+        let value = HeaderValue::from_str(auth)
+            .map_err(|error| format!("invalid Authorization header: {error}"))?;
+        request.headers_mut().insert(AUTHORIZATION, value);
+    }
+
     let connect_cancel = manager.connect_cancel.lock().await.clone();
     let (socket, _) = tokio::select! {
         _ = connect_cancel.cancelled() => return Err("WebSocket connection cancelled".to_string()),
-        result = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(url)) => result
+        result = tokio::time::timeout(CONNECT_TIMEOUT, connect_async(request)) => result
             .map_err(|_| "WebSocket connection timed out".to_string())?
             .map_err(|error| error.to_string())?,
     };
@@ -177,9 +196,15 @@ async fn connect(
     manager: tauri::State<'_, WebSocketManager>,
     url: String,
     on_message: Channel<serde_json::Value>,
-    _config: Option<serde_json::Value>,
+    config: Option<serde_json::Value>,
 ) -> Result<Id, String> {
-    open_connection(manager.inner(), &url, on_message).await
+    // `config.authorization` (e.g. "Bearer <token>") is attached as the
+    // upgrade request's `Authorization` header for `apikey` auth mode.
+    let authorization = config
+        .as_ref()
+        .and_then(|value| value.get("authorization"))
+        .and_then(|value| value.as_str());
+    open_connection(manager.inner(), &url, authorization, on_message).await
 }
 
 async fn send_message(
@@ -374,7 +399,7 @@ mod tests {
         });
 
         let manager = WebSocketManager::default();
-        let id = open_connection(&manager, &format!("ws://{address}"), silent_channel())
+        let id = open_connection(&manager, &format!("ws://{address}"), None, silent_channel())
             .await
             .unwrap();
         send_message(&manager, id, WebSocketMessage::Text("live-probe".into()))

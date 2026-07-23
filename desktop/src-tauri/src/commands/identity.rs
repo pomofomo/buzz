@@ -82,6 +82,69 @@ pub fn get_media_proxy_port(state: State<'_, AppState>) -> u16 {
         .load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Resolve the active relay auth mode: `"apikey"` (bearer) or `"nostr"`
+/// (NIP-42/NIP-98 signing). The `BUZZ_AUTH_MODE` env var is authoritative when
+/// set to a recognized value; otherwise the mode is `"apikey"` when an API
+/// bearer token is configured (env override or keyring) and `"nostr"`
+/// otherwise. This lets the desktop client default to the bearer doorway once
+/// a key is provisioned while still supporting the legacy Nostr doorway.
+#[tauri::command]
+pub fn get_auth_mode(state: State<'_, AppState>) -> String {
+    if let Ok(mode) = std::env::var("BUZZ_AUTH_MODE") {
+        let normalized = mode.trim().to_ascii_lowercase();
+        if normalized == "apikey" || normalized == "nostr" {
+            return normalized;
+        }
+    }
+    if state.api_key().is_some() {
+        "apikey".to_string()
+    } else {
+        "nostr".to_string()
+    }
+}
+
+/// Return the configured API bearer token, if any. The frontend attaches this
+/// as an `Authorization: Bearer <token>` header on the WebSocket upgrade and
+/// HTTP bridge calls when running in `apikey` auth mode. Returns `None` when no
+/// token is configured (the client then uses the Nostr doorway).
+#[tauri::command]
+pub fn get_api_key(state: State<'_, AppState>) -> Option<String> {
+    state.api_key()
+}
+
+/// Whether an API bearer token is currently configured (env override or
+/// keyring). Cheap check for the frontend to select the auth doorway without
+/// materializing the secret.
+#[tauri::command]
+pub fn has_api_key(state: State<'_, AppState>) -> bool {
+    state.api_key().is_some()
+}
+
+/// Persist an API bearer token into the OS keyring (alongside the nsec) and
+/// update the in-memory cache. The token is stored verbatim; the server hashes
+/// it on presentation and resolves the actor + scopes from the matching
+/// `api_tokens` row.
+#[tauri::command]
+pub fn set_api_key(key: String, state: State<'_, AppState>) -> Result<(), String> {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return Err("api key must not be empty".to_string());
+    }
+    crate::app_state::persist_api_key(trimmed)?;
+    state.set_cached_api_key(Some(trimmed.to_string()));
+    Ok(())
+}
+
+/// Remove the persisted API bearer token from the OS keyring and clear the
+/// in-memory cache. A subsequent `get_auth_mode` falls back to `"nostr"` unless
+/// `BUZZ_AUTH_MODE`/`BUZZ_API_KEY` force otherwise.
+#[tauri::command]
+pub fn clear_api_key(state: State<'_, AppState>) -> Result<(), String> {
+    crate::app_state::delete_persisted_api_key()?;
+    state.set_cached_api_key(None);
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn sign_event(
     kind: u16,

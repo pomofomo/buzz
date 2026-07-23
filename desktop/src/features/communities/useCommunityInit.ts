@@ -22,6 +22,7 @@ import { resetAgentObserverStore } from "@/features/agents/observerRelayStore";
 import { resetSidebarRelayConnectionCardState } from "@/features/sidebar/ui/useSidebarRelayConnectionCard";
 import { clearMarkdownNodeCache } from "@/shared/ui/markdown/nodeCache";
 import { resetVideoPlayerState } from "@/shared/ui/videoPlayerState";
+import { resetAuthModeCache } from "@/shared/api/authMode";
 
 import { initFirstCommunity } from "./communityStorage";
 import type { Community } from "./types";
@@ -46,6 +47,7 @@ function resetCommunityState(): void {
   resetRenderScopedReactionHydration();
   clearSearchHitEventCache();
   clearMarkdownNodeCache();
+  resetAuthModeCache();
 }
 
 type CommunityInitResult =

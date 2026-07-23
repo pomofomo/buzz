@@ -16,7 +16,6 @@ import {
   MonitorCog,
   Moon,
   ShieldAlert,
-  Smartphone,
   Smile,
   Sun,
   SunMoon,
@@ -73,7 +72,6 @@ import { DoctorSettingsPanel } from "./DoctorSettingsPanel";
 import { ExperimentalFeaturesCard } from "./ExperimentalFeaturesCard";
 import { KeyboardShortcutsCard } from "./KeyboardShortcutsCard";
 import { MeshComputeSettingsCard } from "@/features/mesh-compute/ui/MeshComputeSettingsCard";
-import { MobilePairingCard } from "./MobilePairingCard";
 import { ModerationQueueCard } from "./ModerationQueueCard";
 import { NotificationSettingsCard } from "./NotificationSettingsCard";
 import { PreventSleepSettingsCard } from "./PreventSleepSettingsCard";
@@ -99,7 +97,6 @@ export type SettingsSection =
   | "moderation"
   | "custom-emoji"
   | "local-archive"
-  | "mobile"
   | "updates";
 
 export const DEFAULT_SETTINGS_SECTION: SettingsSection = "profile";
@@ -118,7 +115,6 @@ const SETTINGS_SECTION_VALUES: readonly SettingsSection[] = [
   "moderation",
   "custom-emoji",
   "local-archive",
-  "mobile",
   "updates",
 ];
 
@@ -220,11 +216,6 @@ export const settingsSections: SettingsSectionDescriptor[] = [
     value: "local-archive",
     label: "Local archive",
     icon: Archive,
-  },
-  {
-    value: "mobile",
-    label: "Mobile",
-    icon: Smartphone,
   },
   {
     value: "updates",
@@ -839,8 +830,6 @@ export function renderSettingsSection(
       return <CustomEmojiSettingsCard />;
     case "local-archive":
       return <LocalArchiveSettingsCard />;
-    case "mobile":
-      return <MobilePairingCard currentPubkey={props.currentPubkey} />;
     case "updates":
       return <UpdateChecker />;
     default: {

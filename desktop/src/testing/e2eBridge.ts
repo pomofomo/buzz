@@ -9773,6 +9773,14 @@ export function maybeInstallE2eTauriMocks() {
         return getRelayWsUrl(activeConfig);
       case "get_default_relay_url":
         return getRelayWsUrl(activeConfig);
+      // Auth-mode probe: the mock relay uses the legacy Nostr doorway, so the
+      // bearer/apikey path is never exercised in E2E.
+      case "get_auth_mode":
+        return "nostr";
+      case "get_api_key":
+        return null;
+      case "has_api_key":
+        return false;
       case "get_legacy_workspace_storage":
         return {
           workspaces: null,
