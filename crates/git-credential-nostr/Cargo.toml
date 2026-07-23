@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Git credential helper that produces NIP-98 auth headers for Buzz's git server"
+description = "Git credential helper that produces Bearer auth headers for Buzz's git server"
 
 [lib]
 name = "git_credential_nostr"
@@ -15,7 +15,5 @@ name = "git-credential-nostr"
 path = "src/main.rs"
 
 [dependencies]
-nostr      = { workspace = true }
-serde_json = { workspace = true }
-zeroize    = { workspace = true }
-base64     = "0.22"
+# The bearer credential helper reads the API key from the environment and emits
+# it verbatim — no Nostr signing, serialization, or base64 encoding required.

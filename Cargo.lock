@@ -974,7 +974,6 @@ dependencies = [
  "buzz-cli",
  "buzz-core",
  "git-credential-nostr",
- "git-sign-nostr",
  "ignore",
  "image",
  "nix 0.31.3",
@@ -992,7 +991,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows-sys 0.61.2",
- "zeroize",
 ]
 
 [[package]]
@@ -3054,25 +3052,6 @@ dependencies = [
 [[package]]
 name = "git-credential-nostr"
 version = "0.1.0"
-dependencies = [
- "base64",
- "nostr",
- "serde_json",
- "zeroize",
-]
-
-[[package]]
-name = "git-sign-nostr"
-version = "0.1.0"
-dependencies = [
- "base64",
- "chrono",
- "hex",
- "libc",
- "nostr",
- "serde_json",
- "zeroize",
-]
 
 [[package]]
 name = "git-version"
