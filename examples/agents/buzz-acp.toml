@@ -1,0 +1,24 @@
+# buzz-acp subscription rules (used when BUZZ_ACP_SUBSCRIBE=config).
+#
+# Ordered rules, FIRST MATCH WINS. Each rule may include an evalexpr `filter`
+# over: content, author, kind, channel_id, timestamp
+# helpers: str_contains, str_starts_with, str_ends_with, str_len
+#
+# Filter errors/timeouts FAIL CLOSED (no match) — a broken rule never widens
+# what the agent sees. This file is parsed literally: replace the UUID below
+# with your real incidents-channel UUID (no env substitution happens here).
+
+# 1. Watch the incidents channel for P1/SEV1 from ANYONE — no mention required.
+[[rules]]
+name = "incidents"
+channels = ["00000000-0000-0000-0000-000000000000"]  # <-- your #incidents channel UUID
+kinds = [9]                                            # kind 9 = stream/chat message
+require_mention = false
+filter = 'str_contains(content, "P1") || str_contains(content, "SEV1")'
+
+# 2. Everywhere else: only respond when explicitly @mentioned.
+[[rules]]
+name = "mentions-elsewhere"
+channels = "all"
+kinds = [9]
+require_mention = true

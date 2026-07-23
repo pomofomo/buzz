@@ -1,0 +1,36 @@
+# Runs one self-hosted Buzz agent (Rusty), Claude-backed.
+#   cp .env.example .env   # then fill in secrets + the incidents UUID in buzz-acp.toml
+#   docker compose up -d --build
+#   docker compose logs -f
+
+services:
+  rusty:
+    build:
+      context: ../..                       # repo root — the Dockerfile builds from source
+      dockerfile: examples/agents/Dockerfile
+    image: buzz-agent:rusty
+    container_name: buzz-agent-rusty
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Fixed paths for the mounted config below.
+      BUZZ_ACP_MCP_COMMAND: buzz-dev-mcp
+      BUZZ_ACP_SYSTEM_PROMPT_FILE: /opt/agent/rusty.system.md
+      BUZZ_ACP_CONFIG: /opt/agent/buzz-acp.toml
+      # git-credential-nostr / git-sign-nostr use the same key for git auth+signing.
+      NOSTR_PRIVATE_KEY: ${BUZZ_PRIVATE_KEY}
+    volumes:
+      # Agent config (read-only).
+      - ./rusty.system.md:/opt/agent/rusty.system.md:ro
+      - ./buzz-acp.toml:/opt/agent/buzz-acp.toml:ro
+      # Persistent workspace (REPOS/, PLANS/, memory, .scratch/) survives restarts.
+      - rusty-workspace:/home/agent/workspace
+    # Sandboxing / blast-radius limits (see AGENT_SETUP.md §6).
+    mem_limit: 4g
+    cpus: 2.0
+    pids_limit: 512
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  rusty-workspace:

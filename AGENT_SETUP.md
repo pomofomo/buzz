@@ -575,6 +575,8 @@ Run `buzz-acp --help` for the complete flag list.
 
 ## See also
 
+- [`examples/agents/`](examples/agents/) — a runnable self-hosted agent:
+  `docker-compose.yml`, `Dockerfile`, a starter `buzz-acp.toml`, and a persona
 - [AGENTS.md](AGENTS.md) — repo conventions and the agent contributor guide
 - `crates/buzz-acp/src/base_prompt.md` — the compiled-in base prompt
 - `crates/buzz-persona/PERSONA_PACK_SPEC.md` — full persona-pack format
