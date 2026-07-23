@@ -855,6 +855,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "hex",
+ "rust-s3",
  "serde",
  "serde_json",
  "sha2 0.11.0",

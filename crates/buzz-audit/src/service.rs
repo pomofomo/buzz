@@ -224,6 +224,60 @@ impl AuditService {
 
         rows.iter().map(row_to_audit_entry).collect()
     }
+
+    /// Append a **cutover genesis** entry marking a community's migration off
+    /// the Nostr substrate onto API-key auth (decision #4).
+    ///
+    /// This does not restart the chain — it appends one more entry
+    /// ([`AuditAction::CutoverGenesis`]) whose `detail` pins the last Nostr-era
+    /// head hash and its timestamp, so the pre-cutover history remains anchored
+    /// to the chain that continues under the new auth model. The new entry
+    /// chains from the current head exactly like any other append.
+    ///
+    /// Intended to be called **once per community, by an operator, at cutover**
+    /// — it is deliberately not invoked anywhere automatically. `actor` is the
+    /// opaque id of the operator performing the cutover, if attributable.
+    ///
+    /// `last_nostr_head_hash` is the raw bytes of the community's chain-head
+    /// hash as it stood at the flag flip; `last_nostr_timestamp` is that head's
+    /// recorded time. Both are recorded verbatim (hash as lowercase hex) in
+    /// `detail` and are covered by the new entry's own chain hash.
+    #[instrument(skip(self, last_nostr_head_hash))]
+    pub async fn append_cutover_genesis(
+        &self,
+        community: CommunityId,
+        last_nostr_head_hash: &[u8],
+        last_nostr_timestamp: DateTime<Utc>,
+        actor: Option<Vec<u8>>,
+    ) -> Result<AuditEntry, AuditError> {
+        let detail = build_cutover_genesis_detail(last_nostr_head_hash, last_nostr_timestamp);
+        self.log(NewAuditEntry {
+            community_id: community,
+            action: AuditAction::CutoverGenesis,
+            actor_pubkey: actor,
+            object_id: None,
+            detail,
+        })
+        .await
+    }
+}
+
+/// Build the `detail` JSON for a [`AuditAction::CutoverGenesis`] entry.
+///
+/// Factored out (and pure) so the payload shape is unit-testable without a
+/// database. Records the last Nostr-era head hash (lowercase hex) and its
+/// timestamp (RFC 3339), plus a human-readable note.
+pub fn build_cutover_genesis_detail(
+    last_nostr_head_hash: &[u8],
+    last_nostr_timestamp: DateTime<Utc>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "cutover": "nostr_to_apikey",
+        "last_nostr_head_hash": hex::encode(last_nostr_head_hash),
+        "last_nostr_timestamp": last_nostr_timestamp.to_rfc3339(),
+        "note": "Chain continues under API-key auth; this entry pins the final \
+                 Nostr-era head so pre-cutover history stays anchored.",
+    })
 }
 
 fn row_to_audit_entry(row: &sqlx::postgres::PgRow) -> Result<AuditEntry, AuditError> {
@@ -484,6 +538,70 @@ mod tests {
         // won't match A's stored hash → HashMismatch. The forge is rejected.
         let r = svc.verify_chain(CommunityId::from_uuid(b), 1, 1).await;
         assert!(matches!(r, Err(AuditError::HashMismatch { seq: 1 })));
+    }
+
+    #[test]
+    fn cutover_genesis_detail_pins_head_and_timestamp() {
+        let ts = DateTime::parse_from_rfc3339("2026-03-04T05:06:07Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let head = vec![0x1au8; 32];
+        let detail = build_cutover_genesis_detail(&head, ts);
+
+        assert_eq!(detail["last_nostr_head_hash"], "1a".repeat(32));
+        assert_eq!(detail["last_nostr_timestamp"], "2026-03-04T05:06:07+00:00");
+        assert_eq!(detail["cutover"], "nostr_to_apikey");
+        assert!(detail["note"].is_string());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn cutover_genesis_appends_and_chains() {
+        let _g = db_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let svc = AuditService::new(pool.clone());
+        let c = make_community(&pool).await;
+
+        // Seed a couple of ordinary entries — the "Nostr-era" history.
+        svc.log(new_entry(c, AuditAction::EventCreated))
+            .await
+            .unwrap();
+        let last = svc
+            .log(new_entry(c, AuditAction::ChannelCreated))
+            .await
+            .unwrap();
+
+        // Cutover: append a genesis marker pinning `last`'s head hash.
+        let ts = Utc::now();
+        let genesis = svc
+            .append_cutover_genesis(
+                CommunityId::from_uuid(c),
+                &last.hash,
+                ts,
+                Some(vec![0x07; 32]),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(genesis.seq, last.seq + 1, "genesis continues the chain");
+        assert_eq!(genesis.action, AuditAction::CutoverGenesis);
+        assert_eq!(
+            genesis.prev_hash.as_deref(),
+            Some(last.hash.as_slice()),
+            "genesis chains from the prior head"
+        );
+        assert_eq!(
+            genesis.detail["last_nostr_head_hash"],
+            serde_json::json!(hex::encode(&last.hash))
+        );
+
+        // Chain including the genesis entry still verifies end to end.
+        assert!(svc
+            .verify_chain(CommunityId::from_uuid(c), 1, genesis.seq)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
