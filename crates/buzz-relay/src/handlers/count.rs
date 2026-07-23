@@ -91,9 +91,7 @@ pub async fn handle_count(
     // the no-channel-filter SQL pushdown below (which counts every accessible
     // channel). The per-filter targeted-channel repair is bounded by the same
     // scope through `resolve_request_local_access`'s `token_allows` argument.
-    if let Some(allowed) = token_channel_ids.as_deref() {
-        accessible_channels.retain(|channel_id| allowed.contains(channel_id));
-    }
+    super::req::narrow_to_token_channels(&mut accessible_channels, token_channel_ids.as_deref());
 
     // For each filter, count matching events with channel access enforcement.
     let mut total: u64 = 0;

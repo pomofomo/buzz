@@ -671,7 +671,16 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
             ));
             return;
         }
-        handle_agent_observer_event(event, conn_id, &event_id_hex, conn, state).await;
+        handle_agent_observer_event(
+            event,
+            conn_id,
+            &event_id_hex,
+            auth_pubkey,
+            is_apikey,
+            conn,
+            state,
+        )
+        .await;
         return;
     }
 
@@ -695,6 +704,7 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
             &event_id_hex,
             pubkey_bytes,
             auth_pubkey,
+            is_apikey,
             conn,
             state,
         )
@@ -753,37 +763,65 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
 }
 
 /// Handle ephemeral events (kind 20000–29999) — WS-only, never stored.
+///
+/// In `nostr` mode the client-signed event is Schnorr-verified. In `apikey` mode
+/// (`is_apikey`) the client submitted an UNSIGNED intent, so — exactly like the
+/// stored write path — the relay server-authors the frame instead of verifying:
+/// it stamps the authenticated `auth_pubkey` (actor) as the author, recomputes
+/// the id, and clears the signature via
+/// [`buzz_core::authoring::author_event_server_side`]. This lets typing/presence
+/// telemetry flow under bearer auth. `event_id_hex` (used in `OK` responses and
+/// the local-echo dedupe key) is refreshed to the server-authored id.
+#[allow(clippy::too_many_arguments)]
 async fn handle_ephemeral_event(
     event: Event,
     conn_id: uuid::Uuid,
     event_id_hex: &str,
     pubkey_bytes: Vec<u8>,
     auth_pubkey: nostr::PublicKey,
+    is_apikey: bool,
     conn: Arc<ConnectionState>,
     state: Arc<AppState>,
 ) {
-    let event_clone = event.clone();
-    let verify_result = tokio::task::spawn_blocking(move || verify_event(&event_clone)).await;
-
-    match verify_result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
+    let mut event = event;
+    let mut event_id_hex = event_id_hex.to_string();
+    if is_apikey {
+        // Server-author the unsigned intent (no signature to verify).
+        if let Err(e) = buzz_core::authoring::author_event_server_side(&mut event, auth_pubkey) {
+            error!(conn_id = %conn_id, "ephemeral server authoring failed: {e}");
             conn.send(RelayMessage::ok(
-                event_id_hex,
-                false,
-                &format!("invalid: {e}"),
-            ));
-            return;
-        }
-        Err(_) => {
-            conn.send(RelayMessage::ok(
-                event_id_hex,
+                &event_id_hex,
                 false,
                 "error: internal error",
             ));
             return;
         }
+        event_id_hex = event.id.to_hex();
+    } else {
+        let event_clone = event.clone();
+        let verify_result = tokio::task::spawn_blocking(move || verify_event(&event_clone)).await;
+
+        match verify_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                conn.send(RelayMessage::ok(
+                    &event_id_hex,
+                    false,
+                    &format!("invalid: {e}"),
+                ));
+                return;
+            }
+            Err(_) => {
+                conn.send(RelayMessage::ok(
+                    &event_id_hex,
+                    false,
+                    "error: internal error",
+                ));
+                return;
+            }
+        }
     }
+    let event_id_hex = event_id_hex.as_str();
 
     // Special handling for presence events (kind:20001).
     if event_kind_u32(&event) == KIND_PRESENCE_UPDATE {
@@ -934,34 +972,62 @@ fn observer_frame_rate_limited(
 /// These frames bypass storage and are routed as global ephemeral events. The
 /// relay gates publication by the existing `agent_owner_pubkey` mapping and
 /// gates subscription in the REQ handler via the cleartext `p` tag.
+///
+/// In `nostr` mode the client-signed frame is Schnorr-verified. In `apikey` mode
+/// (`is_apikey`) the client submitted an UNSIGNED intent, so the relay
+/// server-authors it: [`buzz_core::authoring::author_event_server_side`] stamps
+/// the authenticated `auth_pubkey` (actor) as the frame author, recomputes the
+/// id, and clears the signature. The downstream owner authorization still runs —
+/// the stamped actor is the frame author, so telemetry frames route as
+/// agent→owner and control frames as owner→agent exactly as with a signed frame,
+/// and the `is_agent_owner` (owner-scoped p-gate) check is unchanged.
 async fn handle_agent_observer_event(
     event: Event,
     conn_id: uuid::Uuid,
     event_id_hex: &str,
+    auth_pubkey: nostr::PublicKey,
+    is_apikey: bool,
     conn: Arc<ConnectionState>,
     state: Arc<AppState>,
 ) {
-    let event_clone = event.clone();
-    let verify_result = tokio::task::spawn_blocking(move || verify_event(&event_clone)).await;
-    match verify_result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
+    let mut event = event;
+    let mut event_id_hex = event_id_hex.to_string();
+    if is_apikey {
+        // Server-author the unsigned intent (no signature to verify).
+        if let Err(e) = buzz_core::authoring::author_event_server_side(&mut event, auth_pubkey) {
+            error!(conn_id = %conn_id, "observer server authoring failed: {e}");
             conn.send(RelayMessage::ok(
-                event_id_hex,
-                false,
-                &format!("invalid: {e}"),
-            ));
-            return;
-        }
-        Err(_) => {
-            conn.send(RelayMessage::ok(
-                event_id_hex,
+                &event_id_hex,
                 false,
                 "error: internal error",
             ));
             return;
         }
+        event_id_hex = event.id.to_hex();
+    } else {
+        let event_clone = event.clone();
+        let verify_result = tokio::task::spawn_blocking(move || verify_event(&event_clone)).await;
+        match verify_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                conn.send(RelayMessage::ok(
+                    &event_id_hex,
+                    false,
+                    &format!("invalid: {e}"),
+                ));
+                return;
+            }
+            Err(_) => {
+                conn.send(RelayMessage::ok(
+                    &event_id_hex,
+                    false,
+                    "error: internal error",
+                ));
+                return;
+            }
+        }
     }
+    let event_id_hex = event_id_hex.as_str();
 
     // Freshness check: reject observer frames with stale/future timestamps
     let now = chrono::Utc::now().timestamp();
@@ -1401,6 +1467,8 @@ mod tests {
             event.clone(),
             conn.conn_id,
             &event.id.to_hex(),
+            agent.public_key(),
+            false, // nostr mode (Nip42 auth): verify the signed frame
             conn,
             state,
         )
