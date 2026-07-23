@@ -3,29 +3,21 @@ import 'dart:convert';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
-import 'package:nostr/nostr.dart' as nostr;
 import 'package:shared_preferences/shared_preferences.dart';
 
-import '../../../shared/crypto/nip44.dart';
 import '../../../shared/relay/relay.dart';
 import '../read_state/read_state_time.dart';
 import 'channel_mutes_storage.dart';
 
+/// Plaintext pass-through. Client-side E2E encryption of per-user settings was
+/// dropped in the API-key migration — the server holds these rows in plaintext,
+/// gated by scope + membership.
 class ChannelMutesCrypto {
-  final Uint8List _conversationKey;
+  const ChannelMutesCrypto();
 
-  ChannelMutesCrypto(String nsec, String pubkey)
-    : _conversationKey = _deriveKey(nsec, pubkey);
+  String encrypt(String plaintext) => plaintext;
 
-  static Uint8List _deriveKey(String nsec, String pubkey) {
-    final privkeyHex = nostr.Nip19.decode(payload: nsec).data;
-    return getConversationKey(privkeyHex, pubkey);
-  }
-
-  String encrypt(String plaintext) => nip44Encrypt(_conversationKey, plaintext);
-
-  String decrypt(String ciphertext) =>
-      nip44Decrypt(_conversationKey, ciphertext);
+  String decrypt(String ciphertext) => ciphertext;
 }
 
 class ChannelMutesManager {

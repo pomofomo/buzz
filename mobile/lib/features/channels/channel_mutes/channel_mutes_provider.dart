@@ -1,5 +1,4 @@
 import 'package:hooks_riverpod/hooks_riverpod.dart';
-import 'package:nostr/nostr.dart' as nostr;
 
 import '../../../shared/relay/relay.dart';
 import '../../../shared/theme/theme_provider.dart';
@@ -34,27 +33,17 @@ class ChannelMutesNotifier extends Notifier<ChannelMutesState> {
     // Rebuild when the active community changes (pubkey may differ).
     ref.watch(activeCommunityProvider);
 
-    final nsec = relayConfig.nsec?.trim();
-    if (nsec == null || nsec.isEmpty) {
-      return const ChannelMutesState();
-    }
-
-    final pubkey = _safePubkeyFromNsec(nsec);
+    final pubkey = relayConfig.actorPubkey?.trim();
     if (pubkey == null || pubkey.isEmpty) {
       return const ChannelMutesState();
     }
 
-    final ChannelMutesCrypto crypto;
-    try {
-      crypto = ChannelMutesCrypto(nsec, pubkey);
-    } catch (_) {
-      return const ChannelMutesState();
-    }
+    const crypto = ChannelMutesCrypto();
 
     final prefs = ref.read(savedPrefsProvider);
     final signedRelay = SignedEventRelay(
       session: ref.read(relaySessionProvider.notifier),
-      nsec: nsec,
+      actorPubkey: pubkey,
     );
 
     late final ChannelMutesManager manager;
@@ -103,13 +92,3 @@ final channelMutesProvider =
     NotifierProvider<ChannelMutesNotifier, ChannelMutesState>(
       ChannelMutesNotifier.new,
     );
-
-String? _safePubkeyFromNsec(String nsec) {
-  try {
-    final privkeyHex = nostr.Nip19.decode(payload: nsec).data;
-    if (privkeyHex.isEmpty) return null;
-    return nostr.Keys(privkeyHex).public;
-  } catch (_) {
-    return null;
-  }
-}

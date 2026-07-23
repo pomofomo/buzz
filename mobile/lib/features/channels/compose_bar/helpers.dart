@@ -142,11 +142,6 @@ void _sendTypingIndicator(
 }) {
   try {
     final config = ref.read(relayConfigProvider);
-    final nsec = config.nsec;
-    if (nsec == null || nsec.isEmpty) return;
-
-    final privkeyHex = nostr.Nip19.decode(payload: nsec).data;
-    if (privkeyHex.isEmpty) return;
 
     final tags = <List<String>>[
       ['h', channelId],
@@ -157,17 +152,17 @@ void _sendTypingIndicator(
         ['e', threadHeadId, '', 'reply'],
     ];
 
-    final event = nostr.Event.from(
+    // Unsigned intent — the bearer-authed socket authenticates the actor and
+    // the relay authors the row. Fire-and-forget, matching desktop.
+    final event = buildUnsignedEvent(
+      pubkey: config.actorPubkey ?? '',
       kind: EventKind.typingIndicator,
       content: '',
       tags: tags,
-      secretKey: privkeyHex,
-      verify: false,
     );
 
-    // Send directly over WebSocket — fire-and-forget, matching desktop.
     final session = ref.read(relaySessionProvider.notifier);
-    session.sendRaw(['EVENT', event.toMap()]);
+    session.sendRaw(['EVENT', event.toJson()]);
   } catch (_) {
     // Fire-and-forget — typing indicator failure is non-fatal.
   }

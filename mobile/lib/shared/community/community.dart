@@ -7,8 +7,16 @@ class Community {
   final String id;
   final String name;
   final String relayUrl;
+
+  /// Opaque 32-byte actor id (hex), provisioned alongside the API key. Occupies
+  /// the same column shape the Nostr pubkey used to. Used for self-scoped
+  /// filters/tags; the server is the authority on the authenticated actor.
   final String? pubkey;
-  final String? nsec;
+
+  /// Bearer API key used to authenticate WebSocket + HTTP requests. Replaces
+  /// the former per-device Nostr secret key — clients no longer hold a private
+  /// signing key.
+  final String? apiKey;
   final DateTime addedAt;
 
   const Community({
@@ -16,7 +24,7 @@ class Community {
     required this.name,
     required this.relayUrl,
     this.pubkey,
-    this.nsec,
+    this.apiKey,
     required this.addedAt,
   });
 
@@ -24,14 +32,14 @@ class Community {
     required String name,
     required String relayUrl,
     String? pubkey,
-    String? nsec,
+    String? apiKey,
   }) {
     return Community(
       id: _uuid.v4(),
       name: name,
       relayUrl: relayUrl,
       pubkey: pubkey,
-      nsec: nsec,
+      apiKey: apiKey,
       addedAt: DateTime.now(),
     );
   }
@@ -40,14 +48,14 @@ class Community {
     String? name,
     String? relayUrl,
     Object? pubkey = _sentinel,
-    Object? nsec = _sentinel,
+    Object? apiKey = _sentinel,
   }) {
     return Community(
       id: id,
       name: name ?? this.name,
       relayUrl: relayUrl ?? this.relayUrl,
       pubkey: pubkey == _sentinel ? this.pubkey : pubkey as String?,
-      nsec: nsec == _sentinel ? this.nsec : nsec as String?,
+      apiKey: apiKey == _sentinel ? this.apiKey : apiKey as String?,
       addedAt: addedAt,
     );
   }
@@ -57,7 +65,7 @@ class Community {
     'name': name,
     'relayUrl': relayUrl,
     if (pubkey != null) 'pubkey': pubkey,
-    if (nsec != null) 'nsec': nsec,
+    if (apiKey != null) 'apiKey': apiKey,
     'addedAt': addedAt.toIso8601String(),
   };
 
@@ -66,7 +74,7 @@ class Community {
     name: json['name'] as String,
     relayUrl: json['relayUrl'] as String,
     pubkey: json['pubkey'] as String?,
-    nsec: json['nsec'] as String?,
+    apiKey: json['apiKey'] as String?,
     addedAt: DateTime.parse(json['addedAt'] as String),
   );
 

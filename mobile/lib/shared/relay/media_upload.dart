@@ -6,10 +6,8 @@ import 'package:flutter/services.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
-import 'package:nostr/nostr.dart' as nostr;
 import 'package:pointycastle/digests/sha256.dart';
 
-import 'media_auth.dart';
 import 'mp4_fast_start.dart';
 import 'relay_provider.dart';
 
@@ -21,8 +19,6 @@ const _transcodeVideoToMp4Method = 'transcodeVideoToMp4';
 const _transcodeImageToJpegMethod = 'transcodeImageToJpeg';
 const _readClipboardImageMethod = 'readClipboardImage';
 const _clipboardHasImageMethod = 'clipboardHasImage';
-const _uploadAuthKind = 24242;
-const _uploadAuthLifetimeSeconds = 300;
 const _heicBrands = {
   'heic',
   'heix',
@@ -130,30 +126,28 @@ class BlobDescriptor {
 
 class MediaUploadService {
   final String _baseUrl;
-  final String? _nsec;
+  final String? _apiKey;
   final PickGalleryImage _pickGalleryImage;
   final PickGalleryVideo _pickGalleryVideo;
   final SanitizeImageBytes _sanitizeImageBytes;
   final TranscodeImageToJpeg _transcodeImageToJpeg;
   final TranscodeVideoToMp4 _transcodeVideoToMp4;
   final ReadClipboardImage _readClipboardImage;
-  final DateTime Function() _now;
   final http.Client _http;
   final bool _ownsHttpClient;
 
   MediaUploadService({
     required String baseUrl,
-    required String? nsec,
+    required String? apiKey,
     required PickGalleryImage pickGalleryImage,
     required PickGalleryVideo pickGalleryVideo,
     SanitizeImageBytes? sanitizeImageBytes,
     TranscodeImageToJpeg? transcodeImageToJpeg,
     TranscodeVideoToMp4? transcodeVideoToMp4,
     ReadClipboardImage? readClipboardImage,
-    DateTime Function()? now,
     http.Client? httpClient,
   }) : _baseUrl = baseUrl,
-       _nsec = nsec,
+       _apiKey = apiKey,
        _pickGalleryImage = pickGalleryImage,
        _pickGalleryVideo = pickGalleryVideo,
        _sanitizeImageBytes = sanitizeImageBytes ?? _sanitizePickedImageBytes,
@@ -161,7 +155,6 @@ class MediaUploadService {
            transcodeImageToJpeg ?? _transcodePickedImageToJpeg,
        _transcodeVideoToMp4 = transcodeVideoToMp4 ?? _transcodePickedVideoToMp4,
        _readClipboardImage = readClipboardImage ?? _readPlatformClipboardImage,
-       _now = now ?? DateTime.now,
        _http = httpClient ?? http.Client(),
        _ownsHttpClient = httpClient == null;
 
@@ -297,49 +290,16 @@ class MediaUploadService {
     required String mimeType,
     required String sha256,
   }) {
+    final apiKey = _apiKey;
+    if (apiKey == null || apiKey.isEmpty) {
+      throw Exception('Cannot upload media: no API key available');
+    }
     final headers = <String, String>{
-      'Authorization': _buildUploadAuthHeader(sha256),
+      'Authorization': 'Bearer $apiKey',
       'Content-Type': mimeType,
       'X-SHA-256': sha256,
     };
     return headers;
-  }
-
-  String _buildUploadAuthHeader(String sha256) {
-    final authEvent = _buildUploadAuthEvent(sha256);
-    final authJson = authEvent.toJson();
-    final encoded = base64Url.encode(utf8.encode(authJson)).replaceAll('=', '');
-    return 'Nostr $encoded';
-  }
-
-  nostr.Event _buildUploadAuthEvent(String sha256) {
-    final nsec = _nsec;
-    if (nsec == null || nsec.isEmpty) {
-      throw Exception('Cannot upload media: no signing key available');
-    }
-
-    final privkeyHex = nostr.Nip19.decode(payload: nsec).data;
-    if (privkeyHex.isEmpty) {
-      throw Exception('Invalid nsec');
-    }
-
-    final expiration =
-        (_now().millisecondsSinceEpoch ~/ 1000) + _uploadAuthLifetimeSeconds;
-    final tags = <List<String>>[
-      ['t', 'upload'],
-      ['x', sha256],
-      ['expiration', '$expiration'],
-      if (extractServerAuthority(_baseUrl) case final authority?)
-        ['server', authority],
-    ];
-
-    return nostr.Event.from(
-      kind: _uploadAuthKind,
-      content: 'Upload buzz-media',
-      tags: tags,
-      secretKey: privkeyHex,
-      verify: false,
-    );
   }
 
   Future<_PreparedUploadImage> _prepareUploadImage(XFile pickedImage) async {
@@ -667,7 +627,7 @@ final mediaUploadServiceProvider = Provider<MediaUploadService>((ref) {
   final picker = ImagePicker();
   final service = MediaUploadService(
     baseUrl: config.baseUrl,
-    nsec: config.nsec,
+    apiKey: config.apiKey,
     pickGalleryImage: () => picker.pickImage(
       source: ImageSource.gallery,
       requestFullMetadata: false,

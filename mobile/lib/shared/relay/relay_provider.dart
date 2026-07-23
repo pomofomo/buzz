@@ -1,21 +1,26 @@
 import 'package:hooks_riverpod/hooks_riverpod.dart';
-import 'package:nostr/nostr.dart' as nostr;
 
-import '../community/community_provider.dart';
+import '../../community/community_provider.dart';
 import 'relay_client.dart';
 
 /// Relay connection configuration.
 ///
-/// In the pure-nostr world the only secrets the app cares about are:
-///   - `baseUrl` — where the relay lives (used for WS + media upload)
-///   - `nsec`    — the user's signing key (drives NIP-42 AUTH and event sigs)
+/// In the API-key world the client authenticates with a bearer token and
+/// identifies itself by an opaque actor id (the value that used to live in the
+/// Nostr `pubkey` column). No private signing key is held on the device.
+///   - `baseUrl`      — where the relay lives (used for WS + media/HTTP)
+///   - `apiKey`       — bearer token attached to WS upgrade + HTTP requests
+///   - `actorPubkey`  — this actor's opaque id, for self-scoped filters/tags
 class RelayConfig {
   final String baseUrl;
 
-  /// Nostr secret key (bech32 nsec) for signing events and NIP-42 AUTH.
-  final String? nsec;
+  /// Bearer API key for authentication.
+  final String? apiKey;
 
-  const RelayConfig({required this.baseUrl, this.nsec});
+  /// This actor's opaque id (hex), provisioned alongside the key.
+  final String? actorPubkey;
+
+  const RelayConfig({required this.baseUrl, this.apiKey, this.actorPubkey});
 
   /// Derive the websocket URL from the HTTP base URL.
   String get wsUrl {
@@ -46,15 +51,23 @@ class RelayConfigNotifier extends Notifier<RelayConfig> {
     final activeAsync = ref.watch(activeCommunityProvider);
     final active = activeAsync.value;
     if (active != null) {
-      return RelayConfig(baseUrl: active.relayUrl, nsec: active.nsec);
+      return RelayConfig(
+        baseUrl: active.relayUrl,
+        apiKey: active.apiKey,
+        actorPubkey: active.pubkey,
+      );
     }
 
     // Fallback to compile-time env config (dev mode).
     return const RelayConfig(baseUrl: Env.relayUrl);
   }
 
-  void update({required String baseUrl, String? nsec}) {
-    state = RelayConfig(baseUrl: baseUrl, nsec: nsec);
+  void update({required String baseUrl, String? apiKey, String? actorPubkey}) {
+    state = RelayConfig(
+      baseUrl: baseUrl,
+      apiKey: apiKey,
+      actorPubkey: actorPubkey,
+    );
   }
 }
 
@@ -62,22 +75,12 @@ final relayConfigProvider = NotifierProvider<RelayConfigNotifier, RelayConfig>(
   RelayConfigNotifier.new,
 );
 
-/// Derive the hex pubkey from a bech32 nsec, or null on any failure.
-String? pubkeyFromNsec(String? nsec) {
-  if (nsec == null || nsec.isEmpty) return null;
-  try {
-    final privkeyHex = nostr.Nip19.decode(payload: nsec).data;
-    if (privkeyHex.isEmpty) return null;
-    return nostr.Keys(privkeyHex).public;
-  } catch (_) {
-    return null;
-  }
-}
-
-/// The current user's hex pubkey, derived from the active community nsec.
+/// The current user's opaque actor id, from the active community.
 final myPubkeyProvider = Provider<String?>((ref) {
   final config = ref.watch(relayConfigProvider);
-  return pubkeyFromNsec(config.nsec);
+  final actor = config.actorPubkey?.trim();
+  if (actor == null || actor.isEmpty) return null;
+  return actor;
 });
 
 /// Provides a [RelayClient] that reacts to config changes.

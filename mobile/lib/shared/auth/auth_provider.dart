@@ -1,5 +1,4 @@
 import 'package:hooks_riverpod/hooks_riverpod.dart';
-import 'package:nostr/nostr.dart' as nostr;
 
 import '../community/community.dart';
 import '../community/community_provider.dart';
@@ -35,7 +34,7 @@ class AuthNotifier extends AsyncNotifier<AuthState> {
           : communities.first;
       await storage.saveActiveId(active.id);
 
-      if (_hasValidNsec(active.nsec)) {
+      if (_hasApiKey(active.apiKey)) {
         return AuthState(status: AuthStatus.authenticated, community: active);
       }
 
@@ -76,7 +75,7 @@ class AuthNotifier extends AsyncNotifier<AuthState> {
     }
 
     // Check if other communities remain — switch to the next one instead of
-    // forcing the user back to the pairing screen.
+    // forcing the user back to the sign-in screen.
     final remaining = await storage.loadAll();
 
     // Invalidate community providers so other consumers pick up the change.
@@ -95,16 +94,7 @@ class AuthNotifier extends AsyncNotifier<AuthState> {
   }
 }
 
-bool _hasValidNsec(String? nsec) {
-  if (nsec == null || nsec.isEmpty) return false;
-  try {
-    final decoded = nostr.Nip19.decode(payload: nsec);
-    return decoded.prefix == nostr.Nip19Prefix.nsec &&
-        decoded.data.length == 64;
-  } catch (_) {
-    return false;
-  }
-}
+bool _hasApiKey(String? apiKey) => apiKey != null && apiKey.isNotEmpty;
 
 final authProvider = AsyncNotifierProvider<AuthNotifier, AuthState>(
   AuthNotifier.new,

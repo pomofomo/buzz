@@ -14,7 +14,6 @@ class CommunityStorage {
   static const _legacyRelayUrl = 'buzz_relay_url';
   static const _legacyToken = 'buzz_token';
   static const _legacyPubkey = 'buzz_pubkey';
-  static const _legacyNsec = 'buzz_nsec';
 
   final FlutterSecureStorage _secure;
 
@@ -43,14 +42,13 @@ class CommunityStorage {
     final legacyToken = await _secure.read(key: _legacyToken);
     if (legacyUrl != null && legacyToken != null) {
       final legacyPubkey = await _secure.read(key: _legacyPubkey);
-      final legacyNsec = await _secure.read(key: _legacyNsec);
 
       final name = Community.nameFromUrl(legacyUrl);
       final community = Community.create(
         name: name,
         relayUrl: legacyUrl,
         pubkey: legacyPubkey,
-        nsec: legacyNsec,
+        apiKey: legacyToken,
       );
 
       await _saveList([community]);
@@ -60,7 +58,6 @@ class CommunityStorage {
       await _secure.delete(key: _legacyRelayUrl);
       await _secure.delete(key: _legacyToken);
       await _secure.delete(key: _legacyPubkey);
-      await _secure.delete(key: _legacyNsec);
 
       return [community];
     }

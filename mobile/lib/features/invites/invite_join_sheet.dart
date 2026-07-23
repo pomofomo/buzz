@@ -3,7 +3,6 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
 import '../../shared/theme/theme.dart';
-import '../pairing/pairing_page.dart';
 import 'invite_join_provider.dart';
 
 Future<void> showInviteJoinSheet(BuildContext context, WidgetRef ref) {
@@ -76,13 +75,6 @@ class InviteJoinSheet extends ConsumerWidget {
                 ),
               ),
             ],
-            const SizedBox(height: Grid.sm),
-            Text(
-              'This phone is the only copy of this identity. If you lose it before pairing or backing up, you’ll lose access as this member.',
-              style: context.textTheme.bodyMedium?.copyWith(
-                color: context.colors.onSurfaceVariant,
-              ),
-            ),
             if (state.status == InviteJoinStatus.error &&
                 state.errorMessage != null) ...[
               const SizedBox(height: Grid.sm),
@@ -156,30 +148,10 @@ class _InviteJoinSuccess extends StatelessWidget {
               'You joined ${communityName ?? host}',
               style: context.textTheme.titleLarge,
             ),
-            const SizedBox(height: Grid.xs),
-            Text(
-              'This phone is the only copy of this identity. If you lose it before pairing or backing up, you’ll lose access as this member.',
-              style: context.textTheme.bodyMedium?.copyWith(
-                color: context.colors.onSurfaceVariant,
-              ),
-            ),
             const SizedBox(height: Grid.lg),
-            FilledButton.icon(
-              onPressed: () {
-                Navigator.of(context).pop();
-                Navigator.of(context).push(
-                  MaterialPageRoute<void>(
-                    builder: (_) => const PairingPage(addingCommunity: true),
-                  ),
-                );
-              },
-              icon: const Icon(LucideIcons.scanLine),
-              label: const Text('Back it up now'),
-            ),
-            const SizedBox(height: Grid.xs),
-            TextButton(
+            FilledButton(
               onPressed: () => Navigator.of(context).pop(),
-              child: const Text('Not now'),
+              child: const Text('Done'),
             ),
           ],
         ),

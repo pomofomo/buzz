@@ -7,7 +7,7 @@ import '../../shared/relay/relay.dart';
 import 'user_profile.dart';
 
 /// The current user's profile (kind:0 metadata) loaded over the relay
-/// WebSocket. Returns null when no nsec is configured or when the user has
+/// WebSocket. Returns null when no actor id is configured or when the user has
 /// not yet published a profile.
 class ProfileNotifier extends AsyncNotifier<UserProfile?> {
   @override
@@ -96,7 +96,7 @@ class PresenceNotifier extends AsyncNotifier<String> {
     final config = ref.read(relayConfigProvider);
     final relay = SignedEventRelay(
       session: ref.read(relaySessionProvider.notifier),
-      nsec: config.nsec,
+      actorPubkey: config.actorPubkey,
     );
     try {
       await relay.submit(
