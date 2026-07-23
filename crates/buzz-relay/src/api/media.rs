@@ -18,8 +18,9 @@ use axum::{
 };
 use base64::Engine;
 use buzz_audit::{AuditAction, NewAuditEntry};
+use buzz_auth::Scope;
 use buzz_core::tenant::TenantContext;
-use buzz_media::{BlobDescriptor, MediaError, UploadAttribution, UploadNetworkInfo};
+use buzz_media::{BlobDescriptor, MediaError, UploadAttribution, UploadAuthz, UploadNetworkInfo};
 
 use crate::state::AppState;
 
@@ -31,13 +32,45 @@ use crate::state::AppState;
 /// Axum processes `FromRequestParts` extractors before `FromRequest` (body)
 /// extractors, so auth rejection happens before any body buffering.
 pub(crate) struct AuthenticatedUpload {
-    auth_event: nostr::Event,
+    principal: UploadPrincipal,
     /// Community resolved from the request host at extraction time (row zero for
     /// this HTTP door), identical to the WS door in `router.rs` and the bridge
     /// door in `bridge.rs`. Server-resolved, never client-supplied.
     tenant: TenantContext,
     route_mode: UploadRouteMode,
     _upload_permit: UploadPermit,
+}
+
+/// How an upload request authenticated, and the identity it resolved to.
+///
+/// `nostr` mode carries the verified kind:24242 Blossom auth event (its `x` tag
+/// is re-verified against the server-computed hash by the upload pipeline).
+/// `apikey` mode carries only the bearer-resolved actor id — the token was
+/// already `files:write`-scoped and membership-checked in the extractor, and the
+/// body is bound to its SHA-256 directly by content-addressing.
+enum UploadPrincipal {
+    /// Nostr/Blossom mode: the verified signed auth event.
+    Blossom(nostr::Event),
+    /// API-key mode: the resolved actor id.
+    ApiKey(nostr::PublicKey),
+}
+
+impl UploadPrincipal {
+    /// The uploading actor id (Blossom signer or bearer-resolved actor).
+    fn actor(&self) -> nostr::PublicKey {
+        match self {
+            Self::Blossom(event) => event.pubkey,
+            Self::ApiKey(actor) => *actor,
+        }
+    }
+
+    /// Borrow this principal as the identity-mode seam the upload pipeline takes.
+    fn as_upload_authz(&self) -> UploadAuthz<'_> {
+        match self {
+            Self::Blossom(event) => UploadAuthz::Blossom(event),
+            Self::ApiKey(actor) => UploadAuthz::ApiKey(*actor),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,73 +201,157 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
 
         let route_mode = upload_route_mode(parts.uri.path())?;
 
-        // 2. Extract and validate Blossom auth event against the bound host.
-        let auth_event = extract_blossom_auth(headers)?;
-        // Use the permissive window (3600s) here because we don't know the
-        // content type yet.  The upload functions re-verify with the correct
-        // per-type window (600s for images, 3600s for video) after the body
-        // has been consumed and the SHA-256 computed.
-        buzz_media::auth::verify_blossom_auth_event(&auth_event, Some(tenant.host()), 3600)?;
+        // 2. Resolve the uploading principal + enforce membership, dispatched on
+        // the active auth mode. `nostr` mode verifies the Blossom (kind:24242)
+        // auth event and its BUD-11 `x`-tag body binding; `apikey` mode
+        // authenticates a bearer token, requires `files:write`, and binds the
+        // body to its SHA-256 directly (content-addressing) instead of the `x`
+        // tag. Both paths enforce relay membership on the resolved actor id, and
+        // both run BEFORE any body is buffered (pre-body auth-rejection).
+        let principal = if state.auth.auth_mode().is_apikey() {
+            resolve_apikey_upload_principal(state, &tenant, headers).await?
+        } else {
+            resolve_blossom_upload_principal(state, &tenant, headers).await?
+        };
 
-        // 3. Require X-SHA-256 header (BUD-11: mandatory for PUT /upload)
-        let claimed_hash = headers
-            .get("x-sha-256")
-            .and_then(|v| v.to_str().ok())
-            .ok_or(MediaError::MissingTag("x-sha-256"))?;
-
-        // Validate format: exactly 64 lowercase hex characters
-        if claimed_hash.len() != 64
-            || !claimed_hash
-                .chars()
-                .all(|c| matches!(c, '0'..='9' | 'a'..='f'))
-        {
-            return Err(MediaError::HashMismatch);
-        }
-
-        // 4. Validate X-SHA-256 matches at least one x tag in the auth event
-        let has_matching_x = auth_event
-            .tags
-            .iter()
-            .any(|tag| tag.kind().to_string() == "x" && (tag.content() == Some(claimed_hash)));
-        if !has_matching_x {
-            return Err(MediaError::HashMismatch);
-        }
-
-        // 5. Relay membership gate (NIP-43). Blossom auth proves the signer
-        // authorized this exact upload hash for this server; NIP-43 answers
-        // whether that Nostr key may use this community's media store. This is
-        // the only upload authority: independent of bearer-token / api_tokens
-        // storage and of `require_auth_token` (which governs the REST API, not
-        // media). On open relays (membership disabled) any valid Blossom signer
-        // may upload, matching the WS door's admission policy.
-        let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
-        crate::api::relay_members::enforce_relay_membership(
-            state,
-            tenant.community(),
-            auth_event.pubkey.as_bytes(),
-            auth_tag,
-        )
-        .await
-        .map_err(|_| MediaError::RelayMembershipRequired)?;
-
-        if upload_rate_limited(state, tenant.community(), &auth_event.pubkey) {
+        // 3. Per-actor rate limit + concurrency permit, keyed on the resolved
+        // actor id in both modes (decision #6 / Lane E attribution).
+        let actor = principal.actor();
+        if upload_rate_limited(state, tenant.community(), &actor) {
             metrics::counter!("buzz_media_upload_rejections_total", "reason" => "rate_limit")
                 .increment(1);
             return Err(MediaError::UploadRateLimitExceeded);
         }
-        let upload_permit = acquire_upload_permit(state, tenant.community(), &auth_event.pubkey)
-            .inspect_err(|_| {
+        let upload_permit =
+            acquire_upload_permit(state, tenant.community(), &actor).inspect_err(|_| {
                 metrics::counter!("buzz_media_upload_rejections_total", "reason" => "concurrency")
                     .increment(1);
             })?;
 
         Ok(AuthenticatedUpload {
-            auth_event,
+            principal,
             tenant,
             route_mode,
             _upload_permit: upload_permit,
         })
     }
+}
+
+/// Authorize a bearer principal for a media action by scope.
+///
+/// Returns [`MediaError::InsufficientScope`] (403) when `scopes` does not carry
+/// `required`. Unlike the read/write bridge gates, media has no empty-scope
+/// bypass: an `apikey` upload/download requires the explicit `files:{write,read}`
+/// scope, so a token minted with no file scopes is denied.
+fn require_files_scope(scopes: &[Scope], required: &Scope) -> Result<(), MediaError> {
+    if scopes.contains(required) {
+        Ok(())
+    } else {
+        Err(MediaError::InsufficientScope)
+    }
+}
+
+/// Validate the X-SHA-256 header (BUD-11: mandatory for PUT /upload) and return
+/// the claimed lowercase-hex hash. Shared by both auth modes so the pre-body
+/// format gate is identical.
+fn require_claimed_sha256(headers: &HeaderMap) -> Result<&str, MediaError> {
+    let claimed_hash = headers
+        .get("x-sha-256")
+        .and_then(|v| v.to_str().ok())
+        .ok_or(MediaError::MissingTag("x-sha-256"))?;
+    if claimed_hash.len() != 64
+        || !claimed_hash
+            .chars()
+            .all(|c| matches!(c, '0'..='9' | 'a'..='f'))
+    {
+        return Err(MediaError::HashMismatch);
+    }
+    Ok(claimed_hash)
+}
+
+/// `nostr` mode upload auth: verify the Blossom kind:24242 auth event, its
+/// BUD-11 `x`-tag body binding, and relay membership on the signer. Behaviour is
+/// unchanged from before Lane E.
+async fn resolve_blossom_upload_principal(
+    state: &AppState,
+    tenant: &TenantContext,
+    headers: &HeaderMap,
+) -> Result<UploadPrincipal, MediaError> {
+    // Extract and validate Blossom auth event against the bound host. Use the
+    // permissive window (3600s) here because we don't know the content type yet;
+    // the upload functions re-verify with the correct per-type window (600s for
+    // images, 3600s for video) after the body has been consumed and the SHA-256
+    // computed.
+    let auth_event = extract_blossom_auth(headers)?;
+    buzz_media::auth::verify_blossom_auth_event(&auth_event, Some(tenant.host()), 3600)?;
+
+    // X-SHA-256 must be present, well-formed, and match at least one `x` tag.
+    let claimed_hash = require_claimed_sha256(headers)?;
+    let has_matching_x = auth_event
+        .tags
+        .iter()
+        .any(|tag| tag.kind().to_string() == "x" && (tag.content() == Some(claimed_hash)));
+    if !has_matching_x {
+        return Err(MediaError::HashMismatch);
+    }
+
+    // Relay membership gate (NIP-43). Blossom auth proves the signer authorized
+    // this exact upload hash for this server; NIP-43 answers whether that Nostr
+    // key may use this community's media store. On open relays (membership
+    // disabled) any valid Blossom signer may upload, matching the WS door's
+    // admission policy.
+    let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
+    crate::api::relay_members::enforce_relay_membership(
+        state,
+        tenant.community(),
+        auth_event.pubkey.as_bytes(),
+        auth_tag,
+    )
+    .await
+    .map_err(|_| MediaError::RelayMembershipRequired)?;
+
+    Ok(UploadPrincipal::Blossom(auth_event))
+}
+
+/// `apikey` mode upload auth: authenticate `Authorization: Bearer <token>` into
+/// an actor + scopes, require [`Scope::FilesWrite`], enforce the still-mandatory
+/// X-SHA-256 format gate, and enforce relay membership on the resolved actor.
+///
+/// The body↔hash binding is content-addressing (the upload pipeline stores under
+/// the server-computed SHA-256), so there is no Blossom `x` tag to match here —
+/// the claimed X-SHA-256 is validated for shape only and never trusted as the
+/// stored key.
+async fn resolve_apikey_upload_principal(
+    state: &AppState,
+    tenant: &TenantContext,
+    headers: &HeaderMap,
+) -> Result<UploadPrincipal, MediaError> {
+    let token = bearer_token(headers)?;
+    let ctx = state
+        .auth
+        .verify_api_key(token, tenant.community(), &state.db)
+        .await
+        .map_err(|_| MediaError::Unauthorized)?;
+
+    // Authorization: uploading requires the `files:write` scope.
+    require_files_scope(&ctx.scopes, &Scope::FilesWrite)?;
+
+    // X-SHA-256 stays mandatory (BUD-11 shape); the real binding is the
+    // server-computed content address, so we validate format only.
+    let _claimed_hash = require_claimed_sha256(headers)?;
+
+    // Relay membership gate on the resolved actor id (no NIP-OA auth tag in
+    // apikey mode — bearer membership is answered by the actor alone).
+    crate::api::relay_members::enforce_relay_membership(
+        state,
+        tenant.community(),
+        ctx.pubkey.as_bytes(),
+        None,
+    )
+    .await
+    .map_err(|_| MediaError::RelayMembershipRequired)?;
+
+    Ok(UploadPrincipal::ApiKey(ctx.pubkey))
 }
 
 /// Build per-event upload attribution when upload records are enabled
@@ -261,7 +378,7 @@ async fn upload_attribution(
 
     let uploader_name = state
         .db
-        .get_user(auth.tenant.community(), &auth.auth_event.pubkey.to_bytes())
+        .get_user(auth.tenant.community(), &auth.principal.actor().to_bytes())
         .await
         .ok()
         .flatten()
@@ -345,7 +462,7 @@ pub async fn upload_blob(
             &state.media_storage,
             &state.config.media,
             &auth.tenant,
-            &auth.auth_event,
+            auth.principal.as_upload_authz(),
             replay,
             content_length,
             attribution,
@@ -376,7 +493,7 @@ pub async fn upload_blob(
                 &state.media_storage,
                 &state.config.media,
                 &auth.tenant,
-                &auth.auth_event,
+                auth.principal.as_upload_authz(),
                 bytes,
                 attribution,
             )
@@ -391,7 +508,7 @@ pub async fn upload_blob(
                 &state.media_storage,
                 &state.config.media,
                 &auth.tenant,
-                &auth.auth_event,
+                auth.principal.as_upload_authz(),
                 bytes,
                 attribution,
             )
@@ -426,7 +543,7 @@ pub async fn upload_blob(
             .send(NewAuditEntry {
                 community_id: auth.tenant.community(),
                 action: AuditAction::MediaUploaded,
-                actor_pubkey: Some(auth.auth_event.pubkey.to_bytes().to_vec()),
+                actor_pubkey: Some(auth.principal.actor().to_bytes().to_vec()),
                 object_id: Some(desc.sha256.clone()),
                 detail: serde_json::json!({
                     "sha256": desc.sha256,
@@ -493,7 +610,32 @@ async fn authenticate_media_read(
 ) -> Result<MediaReadAuth, MediaError> {
     let tenant = bind_media_read_tenant(state, headers).await?;
 
+    // Open-read behaviour is unchanged: when download auth is off, no
+    // authentication is required in either mode.
     if !state.config.require_media_get_auth {
+        return Ok(MediaReadAuth { tenant });
+    }
+
+    // Download auth is on. In `apikey` mode, require a bearer token carrying
+    // `files:read` plus relay membership on the resolved actor. In `nostr` mode,
+    // keep the existing Blossom (kind:24242 `get`) verification.
+    if state.auth.auth_mode().is_apikey() {
+        let token = bearer_token(headers)?;
+        let ctx = state
+            .auth
+            .verify_api_key(token, tenant.community(), &state.db)
+            .await
+            .map_err(|_| MediaError::Unauthorized)?;
+        require_files_scope(&ctx.scopes, &Scope::FilesRead)?;
+        crate::api::relay_members::enforce_relay_membership(
+            state,
+            tenant.community(),
+            ctx.pubkey.as_bytes(),
+            None,
+        )
+        .await
+        .map_err(|_| MediaError::RelayMembershipRequired)?;
+
         return Ok(MediaReadAuth { tenant });
     }
 
@@ -879,6 +1021,24 @@ async fn resolve_s3_key(
         }
         Ok(format!("{}.{}", sha256_ext, sidecar.ext))
     }
+}
+
+/// Extract an `Authorization: Bearer <token>` API key from the request headers.
+///
+/// Used by the `apikey` media auth path. Rejects a missing header
+/// ([`MediaError::MissingAuth`]) and a non-`Bearer` scheme or empty token
+/// ([`MediaError::InvalidAuthScheme`]) — both map to a generic 401 so the
+/// doorway cannot be probed.
+fn bearer_token(headers: &HeaderMap) -> Result<&str, MediaError> {
+    let header = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .ok_or(MediaError::MissingAuth)?;
+    header
+        .strip_prefix("Bearer ")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or(MediaError::InvalidAuthScheme)
 }
 
 /// Extract and verify a kind:24242 Blossom auth event from the `Authorization` header.
@@ -1368,5 +1528,244 @@ mod tests {
     #[test]
     fn test_parse_byte_range_zero_start() {
         assert_eq!(parse_byte_range("bytes=0-0", 1000), Some((0, 0)));
+    }
+
+    // ---- Lane E: API-key (bearer) media auth ----
+    //
+    // Infra-free unit coverage of the apikey decision logic, plus DB-backed
+    // end-to-end coverage of the download auth path (scope-denied,
+    // membership-denied, happy path). The DB-backed tests need Postgres, matching
+    // this module's existing `media_get_auth_*` tests; they run in provisioned CI.
+
+    use buzz_auth::AuthMode;
+
+    fn header_map(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (k, v) in pairs {
+            map.insert(
+                header::HeaderName::from_bytes(k.as_bytes()).expect("header name"),
+                v.parse().expect("header value"),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn bearer_token_parses_valid_and_rejects_missing_or_wrong_scheme() {
+        // Valid bearer, surrounding whitespace trimmed.
+        assert_eq!(
+            bearer_token(&header_map(&[("authorization", "Bearer  tok_abc ")])).expect("token"),
+            "tok_abc"
+        );
+        // Missing header → MissingAuth (401).
+        assert!(matches!(
+            bearer_token(&header_map(&[])),
+            Err(MediaError::MissingAuth)
+        ));
+        // Wrong scheme (Blossom's `Nostr`) → InvalidAuthScheme (401).
+        assert!(matches!(
+            bearer_token(&header_map(&[("authorization", "Nostr abc")])),
+            Err(MediaError::InvalidAuthScheme)
+        ));
+        // Present but empty token → InvalidAuthScheme (401).
+        assert!(matches!(
+            bearer_token(&header_map(&[("authorization", "Bearer   ")])),
+            Err(MediaError::InvalidAuthScheme)
+        ));
+    }
+
+    #[test]
+    fn require_claimed_sha256_enforces_bud11_shape() {
+        assert_eq!(
+            require_claimed_sha256(&header_map(&[("x-sha-256", VALID_HASH)])).expect("hash"),
+            VALID_HASH
+        );
+        // Missing header.
+        assert!(matches!(
+            require_claimed_sha256(&header_map(&[])),
+            Err(MediaError::MissingTag("x-sha-256"))
+        ));
+        // Wrong length / uppercase / non-hex all fail the format gate.
+        for bad in ["abc", &"A".repeat(64), &"g".repeat(64)] {
+            assert!(matches!(
+                require_claimed_sha256(&header_map(&[("x-sha-256", bad)])),
+                Err(MediaError::HashMismatch)
+            ));
+        }
+    }
+
+    #[test]
+    fn require_files_scope_gates_on_scope() {
+        // Present → Ok; there is no empty-scope bypass for media.
+        assert!(require_files_scope(&[Scope::FilesWrite], &Scope::FilesWrite).is_ok());
+        assert!(require_files_scope(&[Scope::FilesRead], &Scope::FilesRead).is_ok());
+        // Wrong scope, and empty scopes, are both denied with 403.
+        assert!(matches!(
+            require_files_scope(&[Scope::FilesRead], &Scope::FilesWrite),
+            Err(MediaError::InsufficientScope)
+        ));
+        assert!(matches!(
+            require_files_scope(&[], &Scope::FilesRead),
+            Err(MediaError::InsufficientScope)
+        ));
+    }
+
+    #[test]
+    fn upload_principal_apikey_exposes_actor_and_authz() {
+        let actor = Keys::generate().public_key();
+        let principal = UploadPrincipal::ApiKey(actor);
+        assert_eq!(principal.actor(), actor);
+        match principal.as_upload_authz() {
+            UploadAuthz::ApiKey(a) => assert_eq!(a, actor),
+            UploadAuthz::Blossom(_) => panic!("expected ApiKey authz"),
+        }
+    }
+
+    /// apikey-mode `AppState` seeded with the `relay.example` community. Returns
+    /// the state plus the resolved community id so tests can mint tokens against it.
+    async fn apikey_state(
+        require_media_get_auth: bool,
+        require_relay_membership: bool,
+    ) -> (Arc<AppState>, buzz_core::CommunityId) {
+        let mut config = crate::config::Config::from_env().expect("default config loads");
+        config.require_relay_membership = require_relay_membership;
+        config.require_media_get_auth = require_media_get_auth;
+        config.redis_url = "redis://127.0.0.1:1".to_string();
+        config.media_uploads_per_minute = 1;
+        config.media_max_concurrent_uploads = 2;
+        config.media_max_concurrent_uploads_per_pubkey = 1;
+        config.auth.auth_mode = AuthMode::ApiKey;
+
+        let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
+        let db = buzz_db::Db::from_pool(pool.clone());
+        let community = db
+            .ensure_configured_community("relay.example")
+            .await
+            .expect("seed relay.example community for apikey media tests")
+            .id;
+        let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("redis pool");
+        let pubsub = Arc::new(
+            buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                .await
+                .expect("pubsub manager"),
+        );
+        let audit = buzz_audit::AuditService::new(pool.clone());
+        let auth = buzz_auth::AuthService::new(config.auth.clone());
+        let search = buzz_search::SearchService::new(pool.clone());
+        let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+            db.clone(),
+            buzz_workflow::WorkflowConfig::default(),
+        ));
+        let media_storage = buzz_media::MediaStorage::new(&config.media).expect("media storage");
+        let (state, _audit_shutdown) = AppState::new(
+            config,
+            db,
+            redis_pool,
+            audit,
+            pubsub,
+            auth,
+            search,
+            workflow_engine,
+            nostr::Keys::generate(),
+            media_storage,
+        );
+        (Arc::new(state), community)
+    }
+
+    fn media_router(state: Arc<AppState>) -> axum::Router {
+        axum::Router::new()
+            .route(
+                "/media/{sha256_ext}",
+                axum::routing::get(get_blob).head(head_blob),
+            )
+            .with_state(state)
+    }
+
+    /// Mint an api_token in the community and return `(plaintext_token, actor)`.
+    async fn seed_api_token(
+        state: &AppState,
+        community: buzz_core::CommunityId,
+        scopes: &[&str],
+    ) -> (String, nostr::PublicKey) {
+        use sha2::{Digest, Sha256};
+        let token = format!("tok_{}", Uuid::new_v4().simple());
+        let hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+        let actor = Keys::generate().public_key();
+        let scope_strings: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
+        state
+            .db
+            .create_api_token(
+                community,
+                &hash,
+                &actor.to_bytes(),
+                "lane-e-test",
+                &scope_strings,
+                None,
+                None,
+            )
+            .await
+            .expect("seed api token");
+        (token, actor)
+    }
+
+    #[tokio::test]
+    async fn media_get_apikey_missing_bearer_rejected() {
+        let (state, _community) = apikey_state(true, false).await;
+        let response = media_router(state)
+            .oneshot(media_request("GET", None))
+            .await
+            .expect("response");
+        // No bearer → generic 401 before the sidecar gate.
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn media_get_apikey_wrong_scope_denied() {
+        let (state, community) = apikey_state(true, false).await;
+        // Token has files:write but NOT files:read — download must be denied.
+        let (token, _actor) = seed_api_token(&state, community, &["files:write"]).await;
+        let response = media_router(state)
+            .oneshot(media_request("GET", Some(format!("Bearer {token}"))))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn media_get_apikey_happy_path_reaches_sidecar_gate() {
+        let (state, community) = apikey_state(true, false).await;
+        let (token, _actor) = seed_api_token(&state, community, &["files:read"]).await;
+        let response = media_router(state)
+            .oneshot(media_request("GET", Some(format!("Bearer {token}"))))
+            .await
+            .expect("response");
+        // Auth passes (valid bearer + files:read + open relay membership); the
+        // request then reaches the sidecar gate and 404s on the missing blob.
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn media_get_apikey_membership_denied() {
+        // Membership required; the token's actor is not a relay member.
+        let (state, community) = apikey_state(true, true).await;
+        let (token, _actor) = seed_api_token(&state, community, &["files:read"]).await;
+        let response = media_router(state)
+            .oneshot(media_request("GET", Some(format!("Bearer {token}"))))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn media_get_apikey_off_flag_allows_unauthenticated_read() {
+        // With download auth off, apikey mode preserves open-read behaviour.
+        let (state, _community) = apikey_state(false, false).await;
+        let response = media_router(state)
+            .oneshot(media_request("GET", None))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

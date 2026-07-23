@@ -2,6 +2,55 @@
 
 use crate::error::MediaError;
 
+/// How an upload was authorized, and how the body↔hash binding is proven.
+///
+/// This is the identity-mode seam for the upload pipeline (Lane E). It carries
+/// exactly the information the pipeline needs — the uploading **actor** and, for
+/// Blossom, the signed auth event to re-verify against the server-computed
+/// SHA-256 — without the pipeline having to know which [`buzz_auth::AuthMode`]
+/// the relay runs.
+///
+/// - [`UploadAuthz::Blossom`] — `nostr` mode. The kind:24242 auth event's `x`
+///   tag is re-verified against the server-computed SHA-256 (BUD-11 §6 body
+///   binding), inside the pipeline's existing `spawn_blocking` verify step. The
+///   actor is the event signer.
+/// - [`UploadAuthz::ApiKey`] — `apikey` mode. The bearer token was already
+///   authenticated, `files:write`-scoped, and membership-checked at the HTTP
+///   door. There is no `x` tag; the body is bound to its SHA-256 **directly** by
+///   content-addressing (the stored key *is* the hash), so no Blossom re-verify
+///   runs. The actor is the token's resolved actor id.
+#[derive(Debug, Clone, Copy)]
+pub enum UploadAuthz<'a> {
+    /// Nostr/Blossom mode: re-verify the signed kind:24242 event's `x` tag binds
+    /// the server-computed hash.
+    Blossom(&'a nostr::Event),
+    /// API-key mode: actor authenticated + scoped + membership-checked at the
+    /// door; body bound to its SHA-256 by content-addressing.
+    ApiKey(nostr::PublicKey),
+}
+
+impl UploadAuthz<'_> {
+    /// The uploading actor id (the `pubkey` column value that attribution,
+    /// storage records, and audit key on).
+    pub fn actor(&self) -> nostr::PublicKey {
+        match self {
+            Self::Blossom(event) => event.pubkey,
+            Self::ApiKey(actor) => *actor,
+        }
+    }
+
+    /// The signed Blossom auth event, when authorization came via Blossom.
+    ///
+    /// `None` in `apikey` mode — there is no signed event to re-verify, and the
+    /// body↔hash binding is content-addressing instead of the BUD-11 `x` tag.
+    pub(crate) fn blossom_event(&self) -> Option<&nostr::Event> {
+        match self {
+            Self::Blossom(event) => Some(event),
+            Self::ApiKey(_) => None,
+        }
+    }
+}
+
 /// Blossom kind:24242 verbs Buzz currently accepts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlossomVerb {
@@ -263,6 +312,23 @@ mod tests {
         let sha256 = "a".repeat(64);
         let event = build_valid_auth(&keys, &sha256);
         assert!(verify_blossom_upload_auth(&event, &sha256, None, 600).is_ok());
+    }
+
+    #[test]
+    fn upload_authz_actor_and_blossom_event() {
+        // Blossom variant exposes the signer and the event for re-verification.
+        let keys = Keys::generate();
+        let sha256 = "a".repeat(64);
+        let event = build_valid_auth(&keys, &sha256);
+        let blossom = UploadAuthz::Blossom(&event);
+        assert_eq!(blossom.actor(), keys.public_key());
+        assert!(blossom.blossom_event().is_some());
+
+        // ApiKey variant carries the actor and skips Blossom re-verification.
+        let actor = Keys::generate().public_key();
+        let apikey = UploadAuthz::ApiKey(actor);
+        assert_eq!(apikey.actor(), actor);
+        assert!(apikey.blossom_event().is_none());
     }
 
     #[test]
