@@ -329,11 +329,18 @@ const overrides = new Map([
   // (NIP-98 signed /query with explicit agent keys + optional x-auth-tag) for
   // bounded-auth agent relay-membership discovery. Load-bearing; queued to
   // split alongside the test-helper split.
-  ["src-tauri/src/relay.rs", 1077],
+  // +5 (1077 -> 1082): apikey-auth (Lane I) — build_nip98_auth_header returns
+  // `Bearer <token>` when an API key is configured, and submit_event /
+  // submit_signed_event route their request auth through it. Load-bearing
+  // auth-doorway change; queued to split alongside the test-helper split.
+  ["src-tauri/src/relay.rs", 1082],
   // degraded-network resilience: visibleChannelId field + getter/setter, NOTICE
   // handler for relay back-pressure, and rate-limit gate imports add ~74 lines
   // of load-bearing degraded-network recovery code. Queued to split.
-  ["src/shared/api/relayClientSession.ts", 1096],
+  // +10 (1096 -> 1106): apikey-auth (Lane I) — bearer WS connect path
+  // (getAuthMode/getApiKey header attach + skip the NIP-42 challenge wait in
+  // apikey mode). Load-bearing auth-doorway change; queued to split.
+  ["src/shared/api/relayClientSession.ts", 1106],
   // Boot-time event sync (persona/team/agent event reconcile) was split out
   // to event_sync.rs, ratcheting this limit 1575 → 1310. Remaining content is
   // the pre-identity data migrations; still queued to split further.
@@ -396,7 +403,12 @@ const overrides = new Map([
   // transition lock doc broadened to cover all protected-PID transitions, and
   // clear_agent_session_caches (per-pubkey retain) added alongside the
   // per-key clear. Load-bearing identity-contract change; queued to split.
-  ["src-tauri/src/app_state.rs", 1081],
+  // +91 (1081 -> 1172): apikey-auth (Lane I) — the API bearer token store:
+  // `api_key` cache field, api_key_from_env, AppState::api_key /
+  // set_cached_api_key accessors, and the API_KEY_NAME keyring load/persist/
+  // delete helpers. Server-authored-rows auth doorway; queued to split the
+  // keyring persistence helpers into an app_state_apikey.rs sibling.
+  ["src-tauri/src/app_state.rs", 1172],
   // multi-slot splitting + no-op suppression (#1309): the ReadStateManager
   // class grew from ~700 lines to ~1019 with the addition of
   // splitContextsIntoBudgetedSlots (pure fn + 5 tests), publishSplitSlots,
