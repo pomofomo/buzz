@@ -806,16 +806,20 @@ dependencies = [
  "buzz-pubsub",
  "buzz-search",
  "buzz-workflow",
+ "chrono",
  "clap",
  "deadpool-redis",
  "hex",
  "nostr",
+ "rand 0.10.1",
  "rustls",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "tokio",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
