@@ -54,8 +54,7 @@ crates/
   # Clients + interop
   buzz-pair-relay     # Ephemeral sidecar relay for NIP-AB device pairing
   buzz-pairing-cli    # CLI for NIP-AB device pairing interop testing
-  git-sign-nostr      # Sign git objects with a Nostr key
-  git-credential-nostr # Git credential helper for Nostr-authed push/fetch
+  git-credential-nostr # Git credential helper for bearer-authed push/fetch
   # Tooling + shared
   buzz-cli            # Agent-first CLI
   buzz-sdk            # Typed Nostr event builders

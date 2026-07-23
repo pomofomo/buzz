@@ -1,20 +1,20 @@
-use nostr::ToBech32;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
-use zeroize::Zeroize;
 
 /// Session-scoped shim directory providing tools and git config to shell children.
 ///
 /// On install:
 /// 1. Creates a 0700 tempdir with symlinks back to our binary (multicall)
-/// 2. If `NOSTR_PRIVATE_KEY` is set: writes a 0600 keyfile, derives the pubkey,
-///    builds ephemeral `GIT_CONFIG_*` env vars, then removes the env var
-/// 3. Prepends the shim dir to PATH
+/// 2. Builds ephemeral `GIT_CONFIG_*` env vars wiring git to the bearer
+///    credential helper (`git-credential-nostr`, name retained), which reads the
+///    API key from `BUZZ_API_KEY` in the child's environment
+/// 3. Removes the obsolete `NOSTR_PRIVATE_KEY` from the process env so it can
+///    never leak to children (bearer auth does not use a Nostr private key)
+/// 4. Prepends the shim dir to PATH
 ///
-/// Shell children receive `path_env`, `git_env`, and `BUZZ_PRIVATE_KEY` (for
-/// the buzz CLI). `NOSTR_PRIVATE_KEY` is removed from the process env after
-/// the keyfile is written — git helpers read from the keyfile only.
-/// Cleaned up on drop (TempDir).
+/// Shell children receive `path_env`, `git_env`, and the inherited process
+/// environment (including `BUZZ_API_KEY`, from which the credential helper mints
+/// `Authorization: Bearer <key>`). Cleaned up on drop (TempDir).
 pub struct Shim {
     _dir: TempDir,
     pub path_env: String,
@@ -29,13 +29,7 @@ impl Shim {
         let self_exe = std::env::current_exe()?;
 
         // Multicall symlinks — all resolve back to this binary.
-        for name in [
-            "rg",
-            "tree",
-            "buzz",
-            "git-credential-nostr",
-            "git-sign-nostr",
-        ] {
+        for name in ["rg", "tree", "buzz", "git-credential-nostr"] {
             symlink(&self_exe, &dir.path().join(name))?;
         }
 
@@ -48,24 +42,14 @@ impl Shim {
             .to_string_lossy()
             .into_owned();
 
-        // Read and unconditionally remove NOSTR_PRIVATE_KEY from this process's
-        // env. The key must never leak to child processes regardless of whether
-        // keyfile creation succeeds.
-        let mut nostr_key = std::env::var("NOSTR_PRIVATE_KEY").ok();
+        // Bearer auth does not use a Nostr private key. Scrub the obsolete
+        // `NOSTR_PRIVATE_KEY` from this process's env so it can never leak to
+        // child processes; `BUZZ_API_KEY` is inherited normally and read by the
+        // credential helper at request time.
         std::env::remove_var("NOSTR_PRIVATE_KEY");
 
-        // Ephemeral git config: write key to 0600 keyfile, derive pubkey, build
-        // GIT_CONFIG_* env vars for nostr auth + signing.
-        let git_env = match nostr_key
-            .as_deref()
-            .and_then(|k| write_keyfile(dir.path(), k))
-        {
-            Some(info) => build_git_env(&info),
-            None => Vec::new(),
-        };
-        if let Some(ref mut k) = nostr_key {
-            k.zeroize();
-        }
+        // Ephemeral git config wiring git to the bearer credential helper.
+        let git_env = build_git_env();
 
         Ok(Self {
             _dir: dir,
@@ -75,83 +59,13 @@ impl Shim {
     }
 }
 
-struct KeyInfo {
-    keyfile_path: String,
-    pubkey_hex: String,
-    npub: String,
-}
-
-/// Write the nostr private key to an owner-only file in the shim dir.
-/// Returns key metadata or None if key is empty/invalid.
-/// Warns to stderr if the key is invalid (operator mistake).
-fn write_keyfile(shim_dir: &Path, raw: &str) -> Option<KeyInfo> {
-    if raw.is_empty() {
-        return None;
-    }
-    let keys = match nostr::Keys::parse(raw) {
-        Ok(k) => k,
-        Err(e) => {
-            eprintln!(
-                "buzz-dev-mcp: warning: NOSTR_PRIVATE_KEY is set but invalid ({e}); \
-                 git auth/signing will be disabled"
-            );
-            return None;
-        }
-    };
-    let pubkey_hex = keys.public_key().to_hex();
-    let npub = keys
-        .public_key()
-        .to_bech32()
-        .unwrap_or_else(|_| pubkey_hex.clone());
-
-    let keyfile = shim_dir.join(".nostr-key");
-    if write_keyfile_atomic(&keyfile, raw.as_bytes()).is_err() {
-        eprintln!(
-            "buzz-dev-mcp: warning: failed to write nostr keyfile; git auth/signing disabled"
-        );
-        return None;
-    }
-    let keyfile_path = match keyfile.to_str() {
-        Some(s) => s.to_owned(),
-        None => {
-            eprintln!(
-                "buzz-dev-mcp: warning: tempdir path is not valid UTF-8; git auth/signing disabled"
-            );
-            return None;
-        }
-    };
-
-    Some(KeyInfo {
-        keyfile_path,
-        pubkey_hex,
-        npub,
-    })
-}
-
-/// Write `data` to `path` with 0600 permissions set at creation time via
-/// `OpenOptions::mode()` (no window where the file is world-readable).
-/// Non-Unix: plain write — acceptable inside our 0700 tempdir.
-#[cfg(unix)]
-fn write_keyfile_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    f.write_all(data)
-}
-
-#[cfg(not(unix))]
-fn write_keyfile_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    std::fs::write(path, data)
-}
-
-/// Derive a NIP-05-style email from the pubkey and relay URL.
-/// Format: `<hex_pubkey>@<relay_host>` (e.g., `ab12...cd@relay.buzz.dev`).
-/// Falls back to `<hex_pubkey>@buzz` if no relay URL is configured.
-fn derive_git_email(pubkey_hex: &str) -> String {
+/// Derive a git commit-author email from the configured relay host.
+/// Format: `agent@<relay_host>` (e.g., `agent@relay.buzz.dev`). Falls back to
+/// `agent@buzz` if no usable relay URL is configured.
+///
+/// Commit identity is advisory only under the bearer model — the server no
+/// longer verifies commit signatures — so a stable, non-secret address suffices.
+fn derive_git_email() -> String {
     let host = std::env::var("BUZZ_RELAY_URL")
         .ok()
         .and_then(|url| {
@@ -168,32 +82,30 @@ fn derive_git_email(pubkey_hex: &str) -> String {
         })
         .filter(|h| !h.is_empty() && !h.starts_with("localhost") && !h.starts_with("127."))
         .unwrap_or_else(|| "buzz".to_owned());
-    format!("{pubkey_hex}@{host}")
+    format!("agent@{host}")
 }
 
-/// Build GIT_CONFIG_COUNT/KEY/VALUE env vars for ephemeral nostr git config.
-/// Composes with any existing GIT_CONFIG_COUNT in the environment. When launched
-/// via buzz-agent (which clears env), the base is always 0 — composition only
-/// matters when dev-mcp is run directly with pre-existing GIT_CONFIG vars.
-fn build_git_env(info: &KeyInfo) -> Vec<(String, String)> {
-    let email = derive_git_email(&info.pubkey_hex);
+/// Build GIT_CONFIG_COUNT/KEY/VALUE env vars wiring git to the bearer credential
+/// helper. Composes with any existing GIT_CONFIG_COUNT in the environment. When
+/// launched via buzz-agent (which clears env), the base is always 0 — composition
+/// only matters when dev-mcp is run directly with pre-existing GIT_CONFIG vars.
+///
+/// No commit/tag signing is configured: git object signing was advisory-only and
+/// never verified server-side, so it is dropped under the API-key model.
+fn build_git_env() -> Vec<(String, String)> {
+    let email = derive_git_email();
     let entries: Vec<(&str, String)> = vec![
-        // Identity — npub as display name, NIP-05-style email
-        ("user.name", info.npub.clone()),
+        // Advisory commit identity (not verified server-side under bearer auth).
+        ("user.name", "buzz-agent".into()),
         ("user.email", email),
-        // Nostr credential helper is additive — it silently declines non-Buzz
-        // remotes (exits 0, no credential), so git falls through to system
-        // helpers (osxkeychain, store, etc.) for GitHub/GitLab/etc.
+        // Bearer credential helper (binary name retained). It mints
+        // `Authorization: Bearer <BUZZ_API_KEY>` for Buzz remotes and silently
+        // declines non-Buzz remotes (exits 0, no credential), so git falls through
+        // to system helpers (osxkeychain, store, etc.) for GitHub/GitLab/etc.
         ("credential.helper", "nostr".into()),
-        // Required: Buzz relay verifies NIP-98 against the full repo-root URL.
-        // Without useHttpPath, git only passes the host and auth is rejected.
+        // Pass the full repo path to the helper so it can scope the credential to
+        // the Buzz repo-root URL rather than the bare host.
         ("credential.useHttpPath", "true".into()),
-        ("nostr.keyfile", info.keyfile_path.clone()),
-        ("gpg.format", "x509".into()),
-        ("gpg.x509.program", "git-sign-nostr".into()),
-        ("commit.gpgSign", "true".into()),
-        ("tag.gpgSign", "true".into()),
-        ("user.signingkey", info.pubkey_hex.clone()),
     ];
 
     // Compose with existing GIT_CONFIG_COUNT — don't clobber caller's config.

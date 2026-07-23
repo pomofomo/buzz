@@ -5,7 +5,12 @@
 //! - `POST /git/{owner}/{repo}/git-upload-pack` — clone/fetch
 //! - `POST /git/{owner}/{repo}/git-receive-pack` — push
 //!
-//! Auth: NIP-98 on all routes (clone + push). No public repos for v1.
+//! Auth (flag-gated by `BUZZ_AUTH_MODE`):
+//! - `nostr` mode — NIP-98 on all routes (clone + push). No public repos for v1.
+//! - `apikey` mode — `Authorization: Bearer <token>` resolved via
+//!   [`buzz_auth::AuthService::verify_api_key`]; `repos:read` gates fetch,
+//!   `repos:write` gates push. Relay membership is enforced on the resolved actor.
+//!
 //! Transport: shells out to `git --stateless-rpc` with `env_clear()`.
 
 use std::future::Future;
@@ -51,19 +56,53 @@ const RECEIVE_PACK_MAX_OUTPUT_BYTES: u64 = 1024 * 1024;
 /// Maximum ref advertisement output after manifest ref-count validation.
 const INFO_REFS_MAX_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
 
-/// NIP-98 auth extractor for git routes.
+/// Auth extractor for git routes.
 ///
-/// Validates the `Authorization: Nostr <base64>` header before the request body
-/// is read. Same pattern as `AuthenticatedUpload` in media.rs.
+/// Validates the `Authorization` header before the request body is read. The
+/// active doorway is selected by [`buzz_auth::AuthMode`] (`BUZZ_AUTH_MODE`):
 ///
-/// Authorization model: any authenticated pubkey can clone; push authorization
-/// is handled by the pre-receive hook (calls back to the internal policy endpoint
-/// which checks channel role + protection rules from kind:30617).
+/// - `nostr` mode — `Authorization: Nostr <base64>` (NIP-98). Same pattern as
+///   `AuthenticatedUpload` in media.rs.
+/// - `apikey` mode — `Authorization: Bearer <token>` resolved via
+///   [`buzz_auth::AuthService::verify_api_key`]. The resolved actor id is carried
+///   in the retained [`GitAuth::pubkey`] field (refactor decision #2), so the push
+///   pipeline, policy hook, and object-storage keying operate on the actor id hex
+///   with no path-shape change.
+///
+/// Authorization model: any authenticated principal can clone (in apikey mode
+/// gated by `repos:read`); push requires `repos:write` in apikey mode, and
+/// ref-level authorization is handled by the pre-receive hook (calls back to the
+/// internal policy endpoint which checks channel role + protection rules from
+/// kind:30617). Relay membership is enforced on the principal in both modes.
 pub struct GitAuth {
-    /// The authenticated user's public key, extracted from the NIP-98 event.
+    /// The authenticated principal. In `nostr` mode this is the NIP-98 signer's
+    /// public key; in `apikey` mode it is the token's opaque 32-byte actor id
+    /// (the field name is retained per refactor decision #2).
     pub pubkey: nostr::PublicKey,
     /// Server-resolved tenant bound from the request Host before auth checks.
     pub tenant: TenantContext,
+}
+
+/// The `repos` scope a git request requires, derived from the HTTP path and
+/// (for `info/refs`) the `service` query parameter.
+///
+/// Fetch (`git-upload-pack`, and the `info/refs` advertisement for it) requires
+/// [`buzz_auth::Scope::ReposRead`]; push (`git-receive-pack`, and its `info/refs`
+/// advertisement) requires [`buzz_auth::Scope::ReposWrite`]. Only consulted in
+/// `apikey` mode.
+fn git_required_scope(path: &str, query: Option<&str>) -> buzz_auth::Scope {
+    if path.ends_with("/git-receive-pack") {
+        return buzz_auth::Scope::ReposWrite;
+    }
+    if path.ends_with("/git-upload-pack") {
+        return buzz_auth::Scope::ReposRead;
+    }
+    // info/refs — read vs write depends on the advertised service.
+    if query.is_some_and(|q| q.contains("service=git-receive-pack")) {
+        buzz_auth::Scope::ReposWrite
+    } else {
+        buzz_auth::Scope::ReposRead
+    }
 }
 
 impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
@@ -74,6 +113,28 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
         let method = parts.method.as_str();
+
+        // Row zero for Git HTTP: bind the request Host to a server-resolved
+        // tenant before any auth check. We never trust forwarded headers; the
+        // tenant resolves through the authoritative communities table. Both auth
+        // doorways need it — the apikey lookup is community-scoped and the NIP-98
+        // `u` verification is checked against the tenant host.
+        let raw_host = parts
+            .headers
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let tenant = crate::tenant::bind_community(&state.db, raw_host)
+            .await
+            .map_err(|_| (StatusCode::NOT_FOUND, "repository not found").into_response())?;
+
+        // apikey mode: bearer token → actor, gated by the repos scope, with the
+        // relay-membership check retained on the resolved actor. The NIP-98 path
+        // below is unchanged and stays the only doorway in nostr mode.
+        if state.auth.auth_mode().is_apikey() {
+            let required_scope = git_required_scope(parts.uri.path(), parts.uri.query());
+            return Self::from_bearer(parts, state, tenant, required_scope).await;
+        }
 
         let auth_header = parts
             .headers
@@ -108,19 +169,9 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
         let event_json = String::from_utf8(event_bytes)
             .map_err(|_| (StatusCode::UNAUTHORIZED, "invalid utf-8").into_response())?;
 
-        // Row zero for Git HTTP: bind the request Host to a server-resolved
-        // tenant before URL verification. We still do not trust forwarded
-        // headers; the signed `u` tag is checked against the host that resolved
-        // through the authoritative communities table, not a deployment-global
+        // The signed `u` tag is checked against the tenant host resolved above
+        // (through the authoritative communities table), not a deployment-global
         // `config.relay_url` and not any client-supplied community value.
-        let raw_host = parts
-            .headers
-            .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let tenant = crate::tenant::bind_community(&state.db, raw_host)
-            .await
-            .map_err(|_| (StatusCode::NOT_FOUND, "repository not found").into_response())?;
         let expected_url = git_expected_url(
             &state.config.relay_url,
             &tenant,
@@ -215,6 +266,84 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
         }
 
         Ok(GitAuth { pubkey, tenant })
+    }
+}
+
+impl GitAuth {
+    /// Resolve a bearer-token git request into an authenticated actor (apikey mode).
+    ///
+    /// Validates `Authorization: Bearer <token>` via
+    /// [`buzz_auth::AuthService::verify_api_key`] (community-scoped to `tenant`),
+    /// enforces `required_scope` (`repos:read` for fetch, `repos:write` for push),
+    /// and applies the relay-membership gate to the resolved actor. On success the
+    /// actor id is carried in [`GitAuth::pubkey`] so the downstream push pipeline,
+    /// policy hook, and object-storage keying are identity-shape unchanged.
+    ///
+    /// Bearer tokens carry no NIP-OA delegation tag, so the membership check runs
+    /// without an auth tag — a direct-member actor resolves via the standard check.
+    async fn from_bearer(
+        parts: &mut axum::http::request::Parts,
+        state: &Arc<AppState>,
+        tenant: TenantContext,
+        required_scope: buzz_auth::Scope,
+    ) -> Result<Self, Response> {
+        let token = parts
+            .headers
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header("WWW-Authenticate", "Bearer realm=\"buzz\"")
+                    .body(Body::from("missing Authorization: Bearer token"))
+                    .unwrap()
+            })?;
+
+        let ctx = state
+            .auth
+            .verify_api_key(token, tenant.community(), &state.db)
+            .await
+            .map_err(|e| {
+                warn!(error = %e, "git bearer auth failed");
+                (StatusCode::UNAUTHORIZED, "invalid bearer token").into_response()
+            })?;
+
+        // Action-level scope gate: fetch needs repos:read, push needs repos:write.
+        buzz_auth::require_scope(&ctx.scopes, required_scope.clone()).map_err(|_| {
+            warn!(
+                actor = %ctx.pubkey.to_hex(),
+                scope = %required_scope.as_str(),
+                "git: token lacks required repos scope"
+            );
+            (
+                StatusCode::FORBIDDEN,
+                format!("restricted: token lacks {} scope", required_scope.as_str()),
+            )
+                .into_response()
+        })?;
+
+        // Relay membership gate on the resolved actor. No NIP-OA auth tag over the
+        // bearer path, so pass `None`; the FORBIDDEN shape mirrors the NIP-98 path.
+        if crate::api::relay_members::enforce_relay_membership(
+            state,
+            tenant.community(),
+            ctx.pubkey.as_bytes(),
+            None,
+        )
+        .await
+        .is_err()
+        {
+            warn!(actor = %ctx.pubkey.to_hex(), "git: relay membership denied");
+            return Err((StatusCode::FORBIDDEN, "restricted: not a relay member").into_response());
+        }
+
+        Ok(GitAuth {
+            pubkey: ctx.pubkey,
+            tenant,
+        })
     }
 }
 
@@ -1966,6 +2095,43 @@ mod track_c_tests {
         }
         assert_eq!(i, bytes.len(), "pkt-line stream must consume exactly");
         out
+    }
+
+    /// The apikey-mode git scope gate: fetch endpoints require `repos:read`,
+    /// push endpoints require `repos:write`. `info/refs` reads the `service`
+    /// query param to disambiguate the advertisement direction.
+    #[test]
+    fn git_required_scope_maps_endpoints_to_repos_scopes() {
+        use buzz_auth::Scope;
+
+        // POST pack endpoints — direction is in the path.
+        assert_eq!(
+            git_required_scope("/git/owner/repo/git-upload-pack", None),
+            Scope::ReposRead
+        );
+        assert_eq!(
+            git_required_scope("/git/owner/repo/git-receive-pack", None),
+            Scope::ReposWrite
+        );
+
+        // GET info/refs — direction is in the service query param.
+        assert_eq!(
+            git_required_scope("/git/owner/repo/info/refs", Some("service=git-upload-pack")),
+            Scope::ReposRead
+        );
+        assert_eq!(
+            git_required_scope(
+                "/git/owner/repo/info/refs",
+                Some("service=git-receive-pack")
+            ),
+            Scope::ReposWrite
+        );
+
+        // info/refs with no/unknown service defaults to the read (clone) scope.
+        assert_eq!(
+            git_required_scope("/git/owner/repo/info/refs", None),
+            Scope::ReposRead
+        );
     }
 
     #[test]
