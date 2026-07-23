@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use nostr::{Event, EventBuilder, Filter, Keys, Kind, Tag};
+use nostr::{Event, EventBuilder, Filter, Keys, Kind, PublicKey, Tag};
 use serde_json::{json, Value};
 use thiserror::Error;
 use tracing::debug;
@@ -55,6 +55,10 @@ pub enum TestClientError {
     /// No NIP-42 AUTH challenge was received from the relay.
     #[error("No AUTH challenge received from relay")]
     NoAuthChallenge,
+
+    /// Server-side authoring of an unsigned intent envelope failed (apikey mode).
+    #[error("intent authoring error: {0}")]
+    Authoring(String),
 }
 
 impl From<WsClientError> for TestClientError {
@@ -80,6 +84,16 @@ impl From<nostr::event::builder::Error> for TestClientError {
     }
 }
 
+/// Build an `Authorization: Bearer <token>` header value for API-key HTTP calls.
+///
+/// The bearer counterpart to the Blossom `Authorization: Nostr <base64(event)>`
+/// header used by nostr-mode media/HTTP tests. Under `apikey` mode the relay's
+/// HTTP surface (`POST /events`, `POST /query`, `POST /count`, Blossom media,
+/// git transport) authenticates via this header instead of a signed event.
+pub fn bearer_auth_header(token: &str) -> String {
+    format!("Bearer {token}")
+}
+
 /// WebSocket test client for integration testing against a running Buzz relay.
 pub struct BuzzTestClient {
     inner: NostrWsConnection,
@@ -98,6 +112,67 @@ impl BuzzTestClient {
         let inner = NostrWsConnection::connect(url).await?;
         debug!("connected to relay at {url}");
         Ok(Self { inner })
+    }
+
+    /// Connects to the relay at `url` using API-key **bearer** auth (apikey mode).
+    ///
+    /// Presents `Authorization: Bearer <token>` on the WebSocket upgrade — the
+    /// relay resolves the token at connect (no NIP-42 challenge), so a returned
+    /// client is already authenticated. This is the API-key counterpart to
+    /// [`Self::connect`]; use it for `BUZZ_AUTH_MODE=apikey` tests. Writes go
+    /// through [`Self::publish_intent`] / [`Self::send_text_intent`] (the server
+    /// authors the row); the signed [`Self::send_event`] path is for nostr mode.
+    pub async fn connect_bearer(url: &str, token: &str) -> Result<Self, TestClientError> {
+        let inner = NostrWsConnection::connect_with_bearer(url, token).await?;
+        debug!("connected to relay at {url} with bearer auth");
+        Ok(Self { inner })
+    }
+
+    /// Publishes an **unsigned intent envelope** (API-key / server-authored mode).
+    ///
+    /// In `apikey` mode the client does not sign events — it submits an intent
+    /// whose `kind`, `tags`, `content`, and `created_at` carry the request, and
+    /// the relay authors the row: it stamps the authenticated `actor` as the
+    /// author, recomputes the NIP-01 id, and clears the signature
+    /// ([`buzz_core::authoring::author_event_server_side`]). Because that
+    /// transform is deterministic, this helper applies it locally too so the
+    /// resulting `id` matches the one the relay's `OK` will reference — letting
+    /// the existing OK-correlation plumbing resolve the response.
+    ///
+    /// `actor` is the 32-byte actor id the bearer token resolves to (the token's
+    /// `owner_pubkey`). The `intent`'s own `pubkey`/`id`/`sig` are ignored by the
+    /// server and overwritten here, so any throwaway keys may build it.
+    pub async fn publish_intent(
+        &mut self,
+        intent: Event,
+        actor: PublicKey,
+    ) -> Result<OkResponse, TestClientError> {
+        let mut authored = intent;
+        buzz_core::authoring::author_event_server_side(&mut authored, actor)
+            .map_err(|e| TestClientError::Authoring(e.to_string()))?;
+        self.send_event(authored).await
+    }
+
+    /// Builds and publishes an unsigned text-message intent to `channel_id`.
+    ///
+    /// The API-key counterpart to [`Self::send_text_message`]: it constructs the
+    /// `h`-tagged envelope with a throwaway builder identity and routes it
+    /// through [`Self::publish_intent`], so the relay authors the row as `actor`.
+    pub async fn send_text_intent(
+        &mut self,
+        actor: PublicKey,
+        channel_id: &str,
+        content: &str,
+        kind: u16,
+    ) -> Result<OkResponse, TestClientError> {
+        let h_tag = Tag::parse(["h", channel_id])
+            .map_err(|e| TestClientError::EventBuilder(e.to_string()))?;
+        // The builder keys are irrelevant — the server re-authors from `actor`.
+        let throwaway = Keys::generate();
+        let intent = EventBuilder::new(Kind::Custom(kind), content)
+            .tags([h_tag])
+            .sign_with_keys(&throwaway)?;
+        self.publish_intent(intent, actor).await
     }
 
     /// Performs NIP-42 authentication using `keys` against the connected relay.
@@ -322,6 +397,59 @@ mod tests {
             tags.iter()
                 .any(|t| t.len() >= 2 && t[0] == "challenge" && t[1] == "test-challenge"),
             "missing challenge tag"
+        );
+    }
+
+    #[test]
+    fn bearer_header_is_well_formed() {
+        assert_eq!(bearer_auth_header("abc123"), "Bearer abc123");
+    }
+
+    /// The intent-authoring transform this client applies before publishing must
+    /// match the relay's server-side authoring: the row's author is the actor,
+    /// the id is recomputed (so it differs from the throwaway builder id), and
+    /// the signature is cleared to the all-zero placeholder. This is what lets
+    /// [`BuzzTestClient::publish_intent`] predict the id the relay's OK carries.
+    #[test]
+    fn intent_authoring_stamps_actor_and_recomputes_id() {
+        let actor = Keys::generate().public_key();
+        let throwaway = Keys::generate();
+        let h_tag = Tag::parse(["h", "chan-1"]).unwrap();
+        let intent = EventBuilder::new(Kind::Custom(9), "hi")
+            .tags([h_tag])
+            .sign_with_keys(&throwaway)
+            .unwrap();
+        let original_id = intent.id;
+        let original_author = intent.pubkey;
+        assert_ne!(original_author, actor);
+
+        let mut authored = intent;
+        buzz_core::authoring::author_event_server_side(&mut authored, actor).unwrap();
+
+        assert_eq!(
+            authored.pubkey, actor,
+            "author must be stamped to the actor"
+        );
+        assert_ne!(
+            authored.id, original_id,
+            "id must be recomputed server-side"
+        );
+        assert_eq!(authored.id.as_bytes().len(), 32, "id stays 32 bytes");
+        assert_eq!(
+            authored.sig.serialize(),
+            [0u8; 64],
+            "server-authored sig is the all-zero placeholder"
+        );
+        // Deterministic: re-authoring an identical intent yields the same id.
+        let mut again = EventBuilder::new(Kind::Custom(9), "hi")
+            .tags([Tag::parse(["h", "chan-1"]).unwrap()])
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        again.created_at = authored.created_at;
+        buzz_core::authoring::author_event_server_side(&mut again, actor).unwrap();
+        assert_eq!(
+            again.id, authored.id,
+            "authoring is deterministic in (actor, created_at, kind, tags, content)"
         );
     }
 
