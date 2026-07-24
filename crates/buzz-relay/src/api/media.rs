@@ -1693,6 +1693,14 @@ mod tests {
         let token = format!("tok_{}", Uuid::new_v4().simple());
         let hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
         let actor = Keys::generate().public_key();
+        // The `api_tokens (community_id, owner_pubkey)` FK references
+        // `users (community_id, pubkey)`, so the token's actor must exist as a
+        // user first — otherwise the insert trips the foreign-key constraint.
+        state
+            .db
+            .ensure_user(community, &actor.to_bytes())
+            .await
+            .expect("seed api token owner user");
         let scope_strings: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
         state
             .db

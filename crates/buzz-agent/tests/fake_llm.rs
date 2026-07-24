@@ -140,6 +140,113 @@ async fn spawn_capturing_fake_llm(responses: Vec<Value>) -> (String, Arc<Mutex<V
     (url, captures)
 }
 
+/// Like [`spawn_capturing_fake_llm`], but the **second** request (round 2) is
+/// held until the returned gate is released. This lets a test keep a turn live
+/// (round 1 done, round 2 pending) while it performs a client action — e.g.
+/// steering into the active run — and only then let the turn finish. Without the
+/// gate the two-round turn can race to completion before the client action is
+/// processed, making the test flaky under load.
+async fn spawn_capturing_gated_fake_llm(
+    responses: Vec<Value>,
+) -> (
+    String,
+    Arc<Mutex<Vec<Value>>>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
+    let captures: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let captures_clone = captures.clone();
+    let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+    let gate_rx = Arc::new(Mutex::new(Some(gate_rx)));
+    tokio::spawn(async move {
+        let mut request_num = 0usize;
+        loop {
+            let (mut sock, _) = match listener.accept().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            let queue = queue.clone();
+            let captures = captures_clone.clone();
+            let gate = gate_rx.clone();
+            request_num += 1;
+            let req_num = request_num;
+            tokio::spawn(async move {
+                // Read headers.
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match sock.read(&mut tmp).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    }
+                    if buf.len() > 2_000_000 {
+                        return;
+                    }
+                }
+                let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                let header_str = String::from_utf8_lossy(&buf[..header_end]);
+                let content_length: usize = header_str
+                    .lines()
+                    .find_map(|line| {
+                        let lower = line.to_lowercase();
+                        if lower.starts_with("content-length:") {
+                            lower
+                                .trim_start_matches("content-length:")
+                                .trim()
+                                .parse()
+                                .ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                let mut body_buf = buf[header_end..].to_vec();
+                while body_buf.len() < content_length {
+                    match sock.read(&mut tmp).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => body_buf.extend_from_slice(&tmp[..n]),
+                    }
+                }
+                if let Ok(parsed) =
+                    serde_json::from_slice::<Value>(&body_buf[..content_length.min(body_buf.len())])
+                {
+                    captures.lock().await.push(parsed);
+                }
+
+                // The FIRST round's response is held until the test releases the
+                // gate. `activeRunId` is emitted at prompt start (before this
+                // request resolves), so the test can steer into the live run and
+                // release the gate once the steer is acknowledged. Holding round
+                // 1 guarantees the steer is folded into the conversation *before*
+                // the agent builds the round-2 request — which is the round that
+                // must carry the steered text to the provider.
+                if req_num == 1 {
+                    let rx = gate.lock().await.take();
+                    if let Some(rx) = rx {
+                        let _ = rx.await;
+                    }
+                }
+
+                let body = queue
+                    .lock()
+                    .await
+                    .pop_front()
+                    .unwrap_or_else(|| json!({ "error": "no canned response" }));
+                let body_s = serde_json::to_string(&body).unwrap();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body_s.len(), body_s,
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    (url, captures, gate_tx)
+}
+
 struct Harness {
     child: tokio::process::Child,
     stdin: tokio::process::ChildStdin,
@@ -597,7 +704,14 @@ async fn steer_folds_into_active_turn_without_cancelling() {
     // A two-round turn (tool call → text). A steer sent once the run is live
     // must (a) be accepted with the matching runId, (b) NOT cancel the turn —
     // it still ends with end_turn — and (c) reach the provider as a user turn.
-    let (url, captures) = spawn_capturing_fake_llm(vec![
+    //
+    // Round 2 (the ending text response) is gated so the turn stays live until
+    // the steer has been acknowledged. Without the gate, the two-round turn can
+    // finish before the steer is processed — the steer then finds no active run
+    // and is rejected, which flaked under load (the steer OK carried a null
+    // runId). Releasing the gate only after the steer OK makes the ordering
+    // deterministic.
+    let (url, captures, gate_tx) = spawn_capturing_gated_fake_llm(vec![
         openai_tool_call("call_steer", "fake__noop", json!({})),
         openai_text("acknowledged the steer"),
     ])
@@ -629,35 +743,28 @@ async fn steer_folds_into_active_turn_without_cancelling() {
         )
         .await;
 
-    // Steer is accepted and echoes the run id it landed in.
-    let mut steer_ok = false;
-    let mut end_turn = false;
-    for _ in 0..40 {
-        let v = h.recv().await;
-        if v["id"] == json!(s_id) {
-            assert_eq!(
-                v["result"]["runId"],
-                json!(run_id),
-                "steer ran into the live turn"
-            );
-            assert!(
-                v["result"]["messageId"]
-                    .as_str()
-                    .is_some_and(|m| m.starts_with("steer_")),
-                "steer reply carries a messageId"
-            );
-            steer_ok = true;
-        } else if v["id"] == json!(p_id) {
-            // The turn was NOT cancelled — it completed normally.
-            assert_eq!(v["result"]["stopReason"], "end_turn");
-            end_turn = true;
-        }
-        if steer_ok && end_turn {
-            break;
-        }
-    }
-    assert!(steer_ok, "steer request was not accepted");
-    assert!(end_turn, "turn did not complete with end_turn after steer");
+    // Wait for the steer OK first — the turn is still live (round 2 gated), so
+    // the steer must land in the active run.
+    let steer_reply = h.recv_until(|v| v["id"] == json!(s_id)).await;
+    assert_eq!(
+        steer_reply["result"]["runId"],
+        json!(run_id),
+        "steer ran into the live turn"
+    );
+    assert!(
+        steer_reply["result"]["messageId"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("steer_")),
+        "steer reply carries a messageId"
+    );
+
+    // Now let the turn finish, and confirm it was NOT cancelled.
+    let _ = gate_tx.send(());
+    let prompt_reply = h.recv_until(|v| v["id"] == json!(p_id)).await;
+    assert_eq!(
+        prompt_reply["result"]["stopReason"], "end_turn",
+        "turn did not complete with end_turn after steer"
+    );
 
     // The steered text reached the provider as a user message in some round.
     let reqs = captures.lock().await;

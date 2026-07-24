@@ -1131,7 +1131,9 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(24));
+        // Latest migration is 0025 (Lane A's `actor_id_sig_optional`), which the
+        // API-key refactor appended after this test was first written.
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(25));
     }
 
     #[tokio::test]
