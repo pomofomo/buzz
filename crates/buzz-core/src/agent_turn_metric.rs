@@ -1,15 +1,18 @@
-//! NIP-AM: Agent Turn Metric — payload type and encrypt/decrypt helpers.
+//! NIP-AM: Agent Turn Metric — payload type and encode/decode helpers.
 //!
-//! One `kind:44200` event is published per completed agent turn. Its content
-//! is a NIP-44 v2 ciphertext (agent key → owner pubkey) that decodes to an
-//! [`AgentTurnMetricPayload`] JSON object.
+//! One `kind:44200` event is published per completed agent turn. Its content is
+//! a **plaintext JSON** [`AgentTurnMetricPayload`] object. The event is readable
+//! only by the owner named in its `p` tag: `kind:44200` is both `#p`-gated at the
+//! filter layer and result-gated per event (see [`crate::kind::P_GATED_KINDS`]
+//! and [`crate::kind::RESULT_GATED_KINDS`]), so confidentiality is enforced by
+//! the relay in both auth modes rather than by client-side encryption.
 //!
 //! See `docs/nips/NIP-AM.md` for the full specification.
 
-use nostr::{Event, Keys, PublicKey};
+use nostr::Event;
 use serde::{Deserialize, Serialize};
 
-use crate::observer::{decrypt_observer_payload, encrypt_observer_payload, ObserverPayloadError};
+use crate::observer::{decode_observer_payload, encode_observer_payload, ObserverPayloadError};
 
 // Re-export for callers that only need the error type.
 pub use crate::observer::ObserverPayloadError as AgentTurnMetricError;
@@ -93,7 +96,7 @@ pub struct AgentTurnMetricPayload {
     /// Model identifier as reported by the harness, or `None` if unknown.
     pub model: Option<String>,
 
-    /// Channel UUID the turn served, encrypted inside the payload.
+    /// Channel UUID the turn served.
     pub channel_id: Option<String>,
 
     /// Session identifier. REQUIRED when `cumulative` is present.
@@ -158,35 +161,30 @@ impl AgentTurnMetricPayload {
     }
 }
 
-/// Encrypt an [`AgentTurnMetricPayload`] into a NIP-44 v2 ciphertext string
-/// using the agent's key pair and the owner's public key.
+/// Serialize an [`AgentTurnMetricPayload`] into the plaintext JSON string used as
+/// the content field of a `kind:44200` event.
 ///
 /// Returns `Err(ObserverPayloadError::InvalidPayload)` if any `cost_usd` field
 /// is negative or non-finite (NaN/inf), in accordance with NIP-AM §Numeric
 /// validity.
-///
-/// This is the content field of a `kind:44200` event.
-pub fn encrypt_agent_turn_metric(
-    agent_keys: &Keys,
-    owner_pubkey: &PublicKey,
+pub fn encode_agent_turn_metric(
     payload: &AgentTurnMetricPayload,
 ) -> Result<String, ObserverPayloadError> {
     payload.validate()?;
-    encrypt_observer_payload(agent_keys, owner_pubkey, payload)
+    encode_observer_payload(payload)
 }
 
-/// Decrypt and deserialize an [`AgentTurnMetricPayload`] from a `kind:44200` event.
+/// Parse an [`AgentTurnMetricPayload`] from a `kind:44200` event's plaintext JSON
+/// content.
 ///
-/// `recipient_keys` is the owner's key pair.
-///
-/// Returns `Err(ObserverPayloadError::InvalidPayload)` if the decrypted payload
-/// fails numeric validation (e.g. negative or non-finite `costUsd`), mirroring
-/// the fail-closed contract of [`encrypt_agent_turn_metric`].
-pub fn decrypt_agent_turn_metric(
-    recipient_keys: &Keys,
+/// Returns `Err(ObserverPayloadError::Json)` if the content is not valid payload
+/// JSON (e.g. a legacy ciphertext), or `Err(ObserverPayloadError::InvalidPayload)`
+/// if the parsed payload fails numeric validation (e.g. negative or non-finite
+/// `costUsd`), mirroring the fail-closed contract of [`encode_agent_turn_metric`].
+pub fn decode_agent_turn_metric(
     event: &Event,
 ) -> Result<AgentTurnMetricPayload, ObserverPayloadError> {
-    let payload: AgentTurnMetricPayload = decrypt_observer_payload(recipient_keys, event)?;
+    let payload: AgentTurnMetricPayload = decode_observer_payload(event)?;
     payload.validate()?;
     Ok(payload)
 }
@@ -194,7 +192,7 @@ pub fn decrypt_agent_turn_metric(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nostr::{EventBuilder, Kind, Tag};
+    use nostr::{EventBuilder, Keys, Kind, Tag};
 
     fn sample_payload() -> AgentTurnMetricPayload {
         AgentTurnMetricPayload {
@@ -227,16 +225,16 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_encrypt_decrypt() {
+    fn round_trip_encode_decode() {
         let agent_keys = Keys::generate();
         let owner_keys = Keys::generate();
 
         let payload = sample_payload();
-        let ciphertext = encrypt_agent_turn_metric(&agent_keys, &owner_keys.public_key(), &payload)
-            .expect("encrypt");
+        let content = encode_agent_turn_metric(&payload).expect("encode");
+        // Content is plaintext JSON, not ciphertext.
+        assert!(content.trim_start().starts_with('{'));
 
-        // Build a minimal event envelope so decrypt_observer_payload can use event.pubkey.
-        let event = EventBuilder::new(Kind::Custom(44200), ciphertext)
+        let event = EventBuilder::new(Kind::Custom(44200), content)
             .tags([
                 Tag::parse(["p", &owner_keys.public_key().to_hex()]).unwrap(),
                 Tag::parse(["agent", &agent_keys.public_key().to_hex()]).unwrap(),
@@ -244,22 +242,19 @@ mod tests {
             .sign_with_keys(&agent_keys)
             .expect("sign");
 
-        let decoded = decrypt_agent_turn_metric(&owner_keys, &event).expect("decrypt");
+        let decoded = decode_agent_turn_metric(&event).expect("decode");
 
         assert_eq!(decoded, payload);
     }
 
     #[test]
-    fn wrong_key_decrypt_fails() {
+    fn decode_non_json_content_fails() {
+        // A legacy NIP-44 ciphertext (or any non-JSON blob) must be rejected as a
+        // parse error rather than panicking, so consumers skip it.
         let agent_keys = Keys::generate();
         let owner_keys = Keys::generate();
-        let wrong_keys = Keys::generate();
 
-        let payload = sample_payload();
-        let ciphertext = encrypt_agent_turn_metric(&agent_keys, &owner_keys.public_key(), &payload)
-            .expect("encrypt");
-
-        let event = EventBuilder::new(Kind::Custom(44200), ciphertext)
+        let event = EventBuilder::new(Kind::Custom(44200), "legacy-ciphertext-blob")
             .tags([
                 Tag::parse(["p", &owner_keys.public_key().to_hex()]).unwrap(),
                 Tag::parse(["agent", &agent_keys.public_key().to_hex()]).unwrap(),
@@ -267,8 +262,11 @@ mod tests {
             .sign_with_keys(&agent_keys)
             .expect("sign");
 
-        let result = decrypt_agent_turn_metric(&wrong_keys, &event);
-        assert!(result.is_err(), "expected decrypt error with wrong key");
+        let result = decode_agent_turn_metric(&event);
+        assert!(
+            matches!(result, Err(ObserverPayloadError::Json(_))),
+            "non-JSON content must fail to parse"
+        );
     }
 
     #[test]
@@ -461,36 +459,33 @@ mod tests {
     }
 
     #[test]
-    fn encrypt_agent_turn_metric_rejects_negative_cost() {
-        let agent_keys = Keys::generate();
-        let owner_keys = Keys::generate();
+    fn encode_agent_turn_metric_rejects_negative_cost() {
         let payload = make_payload_with_turn_cost(Some(-0.5));
-        let result = encrypt_agent_turn_metric(&agent_keys, &owner_keys.public_key(), &payload);
+        let result = encode_agent_turn_metric(&payload);
         assert!(
             matches!(result, Err(ObserverPayloadError::InvalidPayload(_))),
-            "encrypt must reject payload with negative costUsd"
+            "encode must reject payload with negative costUsd"
         );
     }
 
     #[test]
-    fn decrypt_agent_turn_metric_rejects_negative_cost_bypassing_encrypt() {
+    fn decode_agent_turn_metric_rejects_negative_cost_bypassing_encode() {
         // Regression: a raw/misbehaving agent can persist a syntactically valid
-        // NIP-44 payload with costUsd: -1 by calling encrypt_observer_payload
-        // directly (bypassing the validating encrypt_agent_turn_metric helper).
-        // decrypt_agent_turn_metric must reject it symmetrically.
-        use crate::observer::encrypt_observer_payload;
+        // payload with costUsd: -1 by serializing directly (bypassing the
+        // validating encode_agent_turn_metric helper). decode_agent_turn_metric
+        // must reject it symmetrically.
+        use crate::observer::encode_observer_payload;
 
         let agent_keys = Keys::generate();
         let owner_keys = Keys::generate();
 
-        // Build a payload with negative costUsd and encrypt via the lower-level
-        // path, bypassing encrypt_agent_turn_metric's validate() call.
+        // Build a payload with negative costUsd and serialize via the lower-level
+        // path, bypassing encode_agent_turn_metric's validate() call.
         let bad_payload = make_payload_with_turn_cost(Some(-1.0));
-        let ciphertext =
-            encrypt_observer_payload(&agent_keys, &owner_keys.public_key(), &bad_payload)
-                .expect("lower-level encrypt should succeed without validation");
+        let content = encode_observer_payload(&bad_payload)
+            .expect("lower-level encode should succeed without validation");
 
-        let event = EventBuilder::new(Kind::Custom(44200), ciphertext)
+        let event = EventBuilder::new(Kind::Custom(44200), content)
             .tags([
                 Tag::parse(["p", &owner_keys.public_key().to_hex()]).unwrap(),
                 Tag::parse(["agent", &agent_keys.public_key().to_hex()]).unwrap(),
@@ -498,11 +493,11 @@ mod tests {
             .sign_with_keys(&agent_keys)
             .expect("sign");
 
-        let result = decrypt_agent_turn_metric(&owner_keys, &event);
+        let result = decode_agent_turn_metric(&event);
         assert!(
             matches!(result, Err(ObserverPayloadError::InvalidPayload(_))),
-            "decrypt must reject a payload with negative costUsd even when \
-             encrypted via the lower-level path"
+            "decode must reject a payload with negative costUsd even when \
+             serialized via the lower-level path"
         );
     }
 }

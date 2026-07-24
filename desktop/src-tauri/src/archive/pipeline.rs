@@ -263,7 +263,6 @@ pub(super) fn commit_archive(
     pre_dropped: u32,
     identity_pk: &str,
     relay_url: &str,
-    owner_keys: &nostr::Keys,
     now: i64,
     conn: &Connection,
 ) -> Result<ArchiveBatchResult, String> {
@@ -273,8 +272,8 @@ pub(super) fn commit_archive(
     // Collect writes; count drops first, then execute inside a single
     // transaction so event and scope rows are always committed atomically.
     //
-    // raw_json is owned so kind-44200 rows can store decrypted plaintext
-    // instead of the original NIP-44 ciphertext.
+    // raw_json is owned so kind-44200 rows can store the canonical plaintext
+    // payload JSON (re-serialized after validation).
     struct WriteRow {
         eid: String,
         kind: i64,
@@ -311,16 +310,14 @@ pub(super) fn commit_archive(
                 continue;
             }
 
-            // For kind-44200 (agent turn metrics): decrypt at ingest and store
-            // the plaintext payload JSON so token-usage calculators can read
-            // the archive without needing the owner key.  Fail-closed: if
-            // decrypt fails for any reason, drop the event — never store
-            // ciphertext or partial output.
+            // For kind-44200 (agent turn metrics): parse the plaintext payload
+            // at ingest and store the canonical JSON so token-usage calculators
+            // read a validated shape. Fail-closed: if the content is not valid
+            // payload JSON (e.g. a legacy ciphertext) or fails numeric
+            // validation, drop the event — never store unparsed content.
             let stored_json =
                 if p.event.kind.as_u16() as u64 == super::KIND_AGENT_TURN_METRIC as u64 {
-                    match buzz_core_pkg::agent_turn_metric::decrypt_agent_turn_metric(
-                        owner_keys, &p.event,
-                    ) {
+                    match buzz_core_pkg::agent_turn_metric::decode_agent_turn_metric(&p.event) {
                         Ok(payload) => match serde_json::to_string(&payload) {
                             Ok(json) => json,
                             Err(_) => {
@@ -424,16 +421,15 @@ pub(super) fn commit_archive(
                 now,
             )?;
 
-            // Index at ingest: attempt to decrypt and extract channelId.
+            // Index at ingest: parse the plaintext frame and extract channelId.
             // Write a status row regardless of outcome so backfill never
             // re-processes this frame (INSERT OR IGNORE on PK is a no-op if
-            // the row is already present from a prior run).
+            // the row is already present from a prior run). Content that does
+            // not parse (e.g. a legacy ciphertext) yields no channel index.
             let channel_id_for_index: Option<String> =
-                buzz_core_pkg::observer::decrypt_observer_payload::<serde_json::Value>(
-                    owner_keys, &p.event,
-                )
-                .ok()
-                .and_then(|v| v.get("channelId")?.as_str().map(|s| s.to_owned()));
+                buzz_core_pkg::observer::decode_observer_payload::<serde_json::Value>(&p.event)
+                    .ok()
+                    .and_then(|v| v.get("channelId")?.as_str().map(|s| s.to_owned()));
             store::upsert_observer_channel_index(
                 &tx,
                 identity_pk,

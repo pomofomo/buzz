@@ -25,7 +25,7 @@ use buzz_core::kind::{
     KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
 };
 use buzz_core::observer::{
-    decrypt_observer_payload, encrypt_observer_payload, OBSERVER_FRAME_TELEMETRY,
+    decode_observer_payload, encode_observer_payload, OBSERVER_FRAME_TELEMETRY,
     OBSERVER_MAX_PLAINTEXT_LEN,
 };
 use clap::Parser;
@@ -375,7 +375,6 @@ fn spawn_relay_observer_publisher(
     keys: nostr::Keys,
     agent_pubkey_hex: String,
     owner_pubkey_hex: String,
-    owner_pubkey: PublicKey,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Subscribe BEFORE snapshotting so an event emitted between the two
@@ -391,7 +390,6 @@ fn spawn_relay_observer_publisher(
             keys,
             agent_pubkey_hex,
             owner_pubkey_hex,
-            owner_pubkey,
         )
         .await;
     })
@@ -404,7 +402,6 @@ async fn run_relay_observer_publisher(
     keys: nostr::Keys,
     agent_pubkey_hex: String,
     owner_pubkey_hex: String,
-    owner_pubkey: PublicKey,
 ) {
     let mut coalescer = ObserverChunkCoalescer::default();
     let mut pacer = ObserverPublishPacer::new();
@@ -416,7 +413,6 @@ async fn run_relay_observer_publisher(
                 &keys,
                 &agent_pubkey_hex,
                 &owner_pubkey_hex,
-                &owner_pubkey,
                 &mut pacer,
                 event,
             )
@@ -439,7 +435,7 @@ async fn run_relay_observer_publisher(
                         for event in coalescer.ingest(event) {
                             publish_relay_observer_event(
                                 &publisher, &keys, &agent_pubkey_hex,
-                                &owner_pubkey_hex, &owner_pubkey, &mut pacer, event,
+                                &owner_pubkey_hex, &mut pacer, event,
                             ).await;
                         }
                     }
@@ -447,7 +443,7 @@ async fn run_relay_observer_publisher(
                         for event in coalescer.flush() {
                             publish_relay_observer_event(
                                 &publisher, &keys, &agent_pubkey_hex,
-                                &owner_pubkey_hex, &owner_pubkey, &mut pacer, event,
+                                &owner_pubkey_hex, &mut pacer, event,
                             ).await;
                         }
                         tracing::warn!(dropped = count, "relay observer publisher lagged");
@@ -456,7 +452,7 @@ async fn run_relay_observer_publisher(
                         for event in coalescer.flush() {
                             publish_relay_observer_event(
                                 &publisher, &keys, &agent_pubkey_hex,
-                                &owner_pubkey_hex, &owner_pubkey, &mut pacer, event,
+                                &owner_pubkey_hex, &mut pacer, event,
                             ).await;
                         }
                         break;
@@ -468,7 +464,7 @@ async fn run_relay_observer_publisher(
                 for event in coalescer.flush() {
                     publish_relay_observer_event(
                         &publisher, &keys, &agent_pubkey_hex,
-                        &owner_pubkey_hex, &owner_pubkey, &mut pacer, event,
+                        &owner_pubkey_hex, &mut pacer, event,
                     ).await;
                 }
             }
@@ -612,9 +608,9 @@ const OBSERVER_LEAF_RETAIN_BYTES: usize = 3_000;
 ///
 /// **Signature choice (`&mut`, double-serialize accepted):** on the common
 /// under-budget path this serializes the frame once to decide it fits, then
-/// `encrypt_observer_payload` serializes it again — one extra `to_string` of an
+/// `encode_observer_payload` serializes it again — one extra `to_string` of an
 /// already-small frame. Reusing that string would mean changing buzz-core's
-/// `encrypt_observer_payload` signature or adding a parallel encrypt path; both
+/// `encode_observer_payload` signature or adding a parallel encode path; both
 /// are out of this change's scope (buzz-core stays untouched). The clean `&mut`
 /// signature with one cheap redundant serialize is the deliberate tradeoff.
 fn fit_observer_event_to_budget(event: &mut observer::ObserverEvent) {
@@ -753,18 +749,17 @@ async fn publish_relay_observer_event(
     keys: &nostr::Keys,
     agent_pubkey_hex: &str,
     owner_pubkey_hex: &str,
-    owner_pubkey: &PublicKey,
     pacer: &mut ObserverPublishPacer,
     mut event: observer::ObserverEvent,
 ) {
     pacer.wait().await;
     // Trim oversized frames to fit the plaintext cap rather than letting
-    // encrypt_observer_payload reject and drop them whole (silent telemetry loss).
+    // encode_observer_payload reject and drop them whole (silent telemetry loss).
     fit_observer_event_to_budget(&mut event);
-    let encrypted = match encrypt_observer_payload(keys, owner_pubkey, &event) {
-        Ok(encrypted) => encrypted,
+    let content = match encode_observer_payload(&event) {
+        Ok(content) => content,
         Err(error) => {
-            tracing::warn!("failed to encrypt relay observer event: {error}");
+            tracing::warn!("failed to encode relay observer event: {error}");
             return;
         }
     };
@@ -772,7 +767,7 @@ async fn publish_relay_observer_event(
         owner_pubkey_hex,
         agent_pubkey_hex,
         OBSERVER_FRAME_TELEMETRY,
-        &encrypted,
+        &content,
     ) {
         Ok(builder) => builder,
         Err(error) => {
@@ -796,7 +791,6 @@ async fn publish_relay_observer_event(
 const OBSERVER_CONTROL_FRESHNESS_SECS: i64 = 300;
 
 fn handle_relay_observer_control_event(
-    keys: &nostr::Keys,
     event: nostr::Event,
     pool: &mut AgentPool,
     observer: Option<&observer::ObserverHandle>,
@@ -830,10 +824,10 @@ fn handle_relay_observer_control_event(
         return;
     }
 
-    let payload = match decrypt_observer_payload::<serde_json::Value>(keys, &event) {
+    let payload = match decode_observer_payload::<serde_json::Value>(&event) {
         Ok(payload) => payload,
         Err(error) => {
-            tracing::warn!("failed to decrypt observer control frame: {error}");
+            tracing::warn!("failed to decode observer control frame: {error}");
             return;
         }
     };
@@ -1365,15 +1359,18 @@ async fn tokio_main() -> Result<()> {
         if let (Some(observer), Some(owner_pubkey_hex)) =
             (observer.clone(), owner_cache.pubkey.clone())
         {
+            // Validate the owner pubkey up front so an invalid one disables the
+            // observer rather than failing later; the parsed key itself is no
+            // longer needed downstream (frames carry plaintext, keyed for read
+            // access by the `p` tag hex).
             match PublicKey::from_hex(&owner_pubkey_hex) {
-                Ok(owner_pubkey) => {
+                Ok(_) => {
                     relay_observer_publisher = Some((
                         observer,
                         relay.event_publisher(),
                         config.keys.clone(),
                         pubkey_hex.clone(),
                         owner_pubkey_hex,
-                        owner_pubkey,
                     ));
                     relay
                         .subscribe_observer_controls()
@@ -1453,7 +1450,7 @@ async fn tokio_main() -> Result<()> {
         }
     }
 
-    if let Some((observer, publisher, keys, agent_pubkey, owner_pubkey, owner)) =
+    if let Some((observer, publisher, keys, agent_pubkey, owner_pubkey_hex)) =
         relay_observer_publisher.take()
     {
         relay_observer_publisher_task = Some(spawn_relay_observer_publisher(
@@ -1461,8 +1458,7 @@ async fn tokio_main() -> Result<()> {
             publisher,
             keys,
             agent_pubkey,
-            owner_pubkey,
-            owner,
+            owner_pubkey_hex,
         ));
     }
 
@@ -1855,7 +1851,7 @@ async fn tokio_main() -> Result<()> {
                     match control_event {
                         Some(event) => {
                             if let Some(ref owner_hex) = owner_cache.pubkey {
-                                handle_relay_observer_control_event(&config.keys, event, &mut pool, observer.as_ref(), owner_hex);
+                                handle_relay_observer_control_event(event, &mut pool, observer.as_ref(), owner_hex);
                             } else {
                                 tracing::warn!("observer control frame received but no owner resolved — dropping");
                             }
@@ -4475,7 +4471,6 @@ mod observer_snapshot_race_tests {
             agent_keys.clone(),
             agent_keys.public_key().to_hex(),
             owner_keys.public_key().to_hex(),
-            owner_keys.public_key(),
         )
         .await;
 
@@ -4485,7 +4480,7 @@ mod observer_snapshot_race_tests {
         let mut markers = Vec::new();
         while let Some(event) = published_rx.recv().await {
             let payload: serde_json::Value =
-                decrypt_observer_payload(&owner_keys, &event).expect("decrypt published frame");
+                decode_observer_payload(&event).expect("decode published frame");
             markers.push(payload["payload"]["marker"].as_str().unwrap().to_string());
         }
         assert_eq!(

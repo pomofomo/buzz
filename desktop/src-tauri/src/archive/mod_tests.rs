@@ -56,33 +56,14 @@ fn add_sub(
 /// Run the full archive pipeline synchronously with a fake relay response.
 ///
 /// Calls `plan_archive` → injects fake relay events → `commit_archive`.
-/// This mirrors `archive_events` without the async relay calls.
+/// This mirrors `archive_events` without the async relay calls. Observer/turn
+/// metric frames carry plaintext JSON, so no owner key is needed to commit.
 fn run_batch_sync(
     candidates: Vec<ArchiveCandidate>,
     identity_pk: &str,
     relay_url: &str,
     conn: &Connection,
     fake_relay_events: Vec<Event>,
-) -> ArchiveBatchResult {
-    let owner_keys = Keys::generate();
-    run_batch_sync_with_keys(
-        candidates,
-        identity_pk,
-        relay_url,
-        conn,
-        fake_relay_events,
-        &owner_keys,
-    )
-}
-
-/// Like `run_batch_sync` but with a specific owner `Keys` for decrypt.
-fn run_batch_sync_with_keys(
-    candidates: Vec<ArchiveCandidate>,
-    identity_pk: &str,
-    relay_url: &str,
-    conn: &Connection,
-    fake_relay_events: Vec<Event>,
-    owner_keys: &Keys,
 ) -> ArchiveBatchResult {
     let plan = plan_archive(candidates, identity_pk, relay_url, conn).unwrap();
 
@@ -108,7 +89,6 @@ fn run_batch_sync_with_keys(
         plan.pre_dropped,
         identity_pk,
         relay_url,
-        owner_keys,
         0,
         conn,
     )
@@ -625,7 +605,7 @@ fn test_commit_archive_rolls_back_when_scope_write_would_fail() {
 
 fn make_turn_metric_event(owner_keys: &Keys, agent_keys: &Keys) -> Event {
     use buzz_core_pkg::agent_turn_metric::{
-        encrypt_agent_turn_metric, AgentTurnMetricPayload, TokenCounts,
+        encode_agent_turn_metric, AgentTurnMetricPayload, TokenCounts,
     };
     let owner_pk = owner_keys.public_key().to_hex();
     let payload = AgentTurnMetricPayload {
@@ -648,13 +628,12 @@ fn make_turn_metric_event(owner_keys: &Keys, agent_keys: &Keys) -> Event {
         delta_reliable: true,
         stop_reason: None,
     };
-    let ciphertext =
-        encrypt_agent_turn_metric(agent_keys, &owner_keys.public_key(), &payload).unwrap();
+    let content = encode_agent_turn_metric(&payload).unwrap();
     let tags = vec![
         Tag::parse(["p", &owner_pk]).unwrap(),
         Tag::parse(["agent", &agent_keys.public_key().to_hex()]).unwrap(),
     ];
-    EventBuilder::new(Kind::Custom(44200), &ciphertext)
+    EventBuilder::new(Kind::Custom(44200), &content)
         .tags(tags)
         .sign_with_keys(agent_keys)
         .unwrap()
@@ -717,9 +696,9 @@ fn test_owner_p_24200_still_routes_to_ephemeral() {
     );
 }
 
-/// Decrypt success: plaintext payload JSON is stored, not raw ciphertext.
+/// Parse success: canonical plaintext payload JSON is stored.
 #[test]
-fn test_turn_metric_decrypt_success_stores_plaintext() {
+fn test_turn_metric_parse_success_stores_plaintext() {
     let conn = in_memory();
     let owner_keys = Keys::generate();
     let agent_keys = Keys::generate();
@@ -729,72 +708,58 @@ fn test_turn_metric_decrypt_success_stores_plaintext() {
 
     let ev = make_turn_metric_event(&owner_keys, &agent_keys);
     let cand = candidate(&ev, ScopeType::OwnerP, &owner_pk);
-    let result = run_batch_sync_with_keys(
-        vec![cand],
-        &owner_pk,
-        relay_url,
-        &conn,
-        vec![ev.clone()],
-        &owner_keys,
-    );
+    let result = run_batch_sync(vec![cand], &owner_pk, relay_url, &conn, vec![ev.clone()]);
 
     assert_eq!(result.persisted, 1, "event must be persisted");
-    assert_eq!(result.dropped, 0, "no drops on successful decrypt");
+    assert_eq!(result.dropped, 0, "no drops on successful parse");
 
-    // The stored raw_json must be plaintext JSON, not NIP-44 ciphertext.
+    // The stored raw_json must be a valid AgentTurnMetricPayload JSON object.
     let raw_json: String = conn
         .query_row("SELECT raw_json FROM archived_events", [], |r| r.get(0))
         .unwrap();
-    // Plaintext JSON should be a valid object with "harness" key.
     let parsed: serde_json::Value =
         serde_json::from_str(&raw_json).expect("stored raw_json must be valid JSON");
     assert_eq!(
         parsed["harness"], "test-harness",
         "stored plaintext must decode to AgentTurnMetricPayload"
     );
-    // Sanity: must NOT be the original NIP-44 ciphertext (which is not JSON).
-    assert_ne!(
-        raw_json, ev.content,
-        "stored content must differ from original ciphertext"
-    );
 }
 
-/// Decrypt fail: event is dropped, nothing written to the store (fail-closed).
+/// Parse fail: an unparseable kind-44200 content (e.g. a legacy ciphertext) is
+/// dropped, nothing written to the store (fail-closed).
 #[test]
-fn test_turn_metric_decrypt_fail_drops_fail_closed() {
+fn test_turn_metric_parse_fail_drops_fail_closed() {
     let conn = in_memory();
     let owner_keys = Keys::generate();
-    let wrong_keys = Keys::generate(); // wrong owner key — decrypt will fail
     let agent_keys = Keys::generate();
     let owner_pk = owner_keys.public_key().to_hex();
     let relay_url = "wss://relay.example";
-    // Register subscription under owner_pk so the event passes plan-phase,
-    // but use `wrong_keys` in commit so decrypt fails.
     add_sub(&conn, &owner_pk, relay_url, "owner_p", &owner_pk, "[44200]");
 
-    let ev = make_turn_metric_event(&owner_keys, &agent_keys);
+    // A kind-44200 event whose content is NOT valid payload JSON — mimics a
+    // legacy NIP-44 ciphertext written before encryption was removed.
+    let ev = EventBuilder::new(Kind::Custom(44200), "legacy-ciphertext-not-json")
+        .tags(vec![
+            Tag::parse(["p", &owner_pk]).unwrap(),
+            Tag::parse(["agent", &agent_keys.public_key().to_hex()]).unwrap(),
+        ])
+        .sign_with_keys(&agent_keys)
+        .unwrap();
     let cand = candidate(&ev, ScopeType::OwnerP, &owner_pk);
-    let result = run_batch_sync_with_keys(
-        vec![cand],
-        &owner_pk,
-        relay_url,
-        &conn,
-        vec![ev.clone()],
-        &wrong_keys, // wrong key → decrypt fails
-    );
+    let result = run_batch_sync(vec![cand], &owner_pk, relay_url, &conn, vec![ev.clone()]);
 
     assert_eq!(
         result.persisted, 0,
-        "decrypt failure must not persist the event"
+        "parse failure must not persist the event"
     );
-    assert_eq!(result.dropped, 1, "decrypt failure must count as dropped");
+    assert_eq!(result.dropped, 1, "parse failure must count as dropped");
 
     let event_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM archived_events", [], |r| r.get(0))
         .unwrap();
     assert_eq!(
         event_count, 0,
-        "no rows must be written to archived_events on decrypt failure"
+        "no rows must be written to archived_events on parse failure"
     );
 }
 
@@ -936,14 +901,12 @@ mod real_relay {
 
         // Phase 3: persist (sync). Fresh connection, same file.
         let conn = store::open_archive_db(db_path).expect("open archive db for commit");
-        let owner_keys = state.keys.lock().unwrap().clone();
         commit_archive(
             bucket_results,
             plan.ephemeral,
             plan.pre_dropped,
             &identity_pk,
             &relay_url,
-            &owner_keys,
             0,
             &conn,
         )

@@ -3336,18 +3336,14 @@ async fn publish_agent_turn_metric(
         delta_reliable: usage.delta_reliable,
         stop_reason,
     };
-    let ciphertext = match buzz_core::agent_turn_metric::encrypt_agent_turn_metric(
-        &ctx.agent_keys,
-        owner_pk,
-        &payload,
-    ) {
+    let content = match buzz_core::agent_turn_metric::encode_agent_turn_metric(&payload) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(
                 target: "pool::metrics",
                 session_id,
                 turn_id,
-                "NIP-AM: encrypt failed: {e}"
+                "NIP-AM: encode failed: {e}"
             );
             return;
         }
@@ -3356,7 +3352,7 @@ async fn publish_agent_turn_metric(
     let owner_hex = owner_pk.to_hex();
     let event = match EventBuilder::new(
         Kind::Custom(buzz_core::kind::KIND_AGENT_TURN_METRIC as u16),
-        ciphertext,
+        content,
     )
     .tags([
         Tag::parse(["p", &owner_hex]).expect("p tag"),

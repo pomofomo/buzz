@@ -156,11 +156,6 @@ pub async fn archive_events(
     let bucket_results = query_buckets(plan.buckets, state_ref).await;
 
     // ── Phase 3: persist (blocking SQLite) ──────────────────────────────────
-    let owner_keys = {
-        let keys_guard = state.keys.lock().map_err(|e| e.to_string())?;
-        keys_guard.clone()
-        // guard drops here, before awaiting the blocking commit task.
-    };
     let commit_identity_pk = identity_pk.clone();
     let commit_relay_url = relay_url.clone();
     run_archive_db_task(move |conn| {
@@ -170,7 +165,6 @@ pub async fn archive_events(
             plan.pre_dropped,
             &commit_identity_pk,
             &commit_relay_url,
-            &owner_keys,
             now,
             conn,
         )

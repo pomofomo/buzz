@@ -11,7 +11,7 @@ use buzz_core::kind::{
     KIND_PRESENCE_UPDATE,
 };
 use buzz_core::observer::{
-    content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
+    content_fits_observer_frame, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
     OBSERVER_FRAME_TELEMETRY,
 };
 use buzz_core::tenant::TenantContext;
@@ -1152,8 +1152,8 @@ async fn handle_agent_observer_event(
 }
 
 fn agent_observer_route(event: &Event) -> Result<Option<AgentObserverRoute>, String> {
-    if !content_looks_like_nip44(&event.content) {
-        return Err("invalid: observer content must be NIP-44 encrypted".into());
+    if !content_fits_observer_frame(&event.content) {
+        return Err("invalid: observer content must be non-empty plaintext within budget".into());
     }
 
     let recipient = parse_single_pubkey_tag(event, "p")?;
@@ -1225,7 +1225,7 @@ mod tests {
         KIND_FORUM_VOTE, KIND_PRESENCE_UPDATE, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_DIFF,
     };
     use buzz_core::observer::{
-        encrypt_observer_payload, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
+        encode_observer_payload, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
         OBSERVER_FRAME_TELEMETRY,
     };
     use nostr::{EventBuilder, Keys, Kind, Tag};
@@ -1302,13 +1302,9 @@ mod tests {
     fn agent_observer_route_accepts_agent_to_owner_telemetry() {
         let agent = Keys::generate();
         let owner = Keys::generate();
-        let encrypted = encrypt_observer_payload(
-            &agent,
-            &owner.public_key(),
-            &serde_json::json!({"type": "acp_read"}),
-        )
-        .expect("encrypt observer payload");
-        let event = EventBuilder::new(Kind::Custom(KIND_AGENT_OBSERVER_FRAME as u16), encrypted)
+        let content = encode_observer_payload(&serde_json::json!({"type": "acp_read"}))
+            .expect("encode observer payload");
+        let event = EventBuilder::new(Kind::Custom(KIND_AGENT_OBSERVER_FRAME as u16), content)
             .tags([
                 Tag::parse(["p", &owner.public_key().to_hex()]).expect("p tag"),
                 Tag::parse([OBSERVER_AGENT_TAG, &agent.public_key().to_hex()]).expect("agent tag"),
@@ -1329,13 +1325,9 @@ mod tests {
     fn agent_observer_route_accepts_owner_to_agent_control() {
         let agent = Keys::generate();
         let owner = Keys::generate();
-        let encrypted = encrypt_observer_payload(
-            &owner,
-            &agent.public_key(),
-            &serde_json::json!({"type": "cancel_turn"}),
-        )
-        .expect("encrypt observer payload");
-        let event = EventBuilder::new(Kind::Custom(KIND_AGENT_OBSERVER_FRAME as u16), encrypted)
+        let content = encode_observer_payload(&serde_json::json!({"type": "cancel_turn"}))
+            .expect("encode observer payload");
+        let event = EventBuilder::new(Kind::Custom(KIND_AGENT_OBSERVER_FRAME as u16), content)
             .tags([
                 Tag::parse(["p", &agent.public_key().to_hex()]).expect("p tag"),
                 Tag::parse([OBSERVER_AGENT_TAG, &agent.public_key().to_hex()]).expect("agent tag"),
@@ -1353,23 +1345,23 @@ mod tests {
     }
 
     #[test]
-    fn agent_observer_route_rejects_plaintext_content() {
+    fn agent_observer_route_rejects_empty_content() {
+        // Content is now plaintext JSON; the only content-shape rejection left is
+        // empty (or over-budget) content.
         let agent = Keys::generate();
         let owner = Keys::generate();
-        let event = EventBuilder::new(
-            Kind::Custom(KIND_AGENT_OBSERVER_FRAME as u16),
-            "not encrypted",
-        )
-        .tags([
-            Tag::parse(["p", &owner.public_key().to_hex()]).expect("p tag"),
-            Tag::parse([OBSERVER_AGENT_TAG, &agent.public_key().to_hex()]).expect("agent tag"),
-            Tag::parse([OBSERVER_FRAME_TAG, OBSERVER_FRAME_TELEMETRY]).expect("frame tag"),
-        ])
-        .sign_with_keys(&agent)
-        .expect("sign event");
+        let event = EventBuilder::new(Kind::Custom(KIND_AGENT_OBSERVER_FRAME as u16), "")
+            .tags([
+                Tag::parse(["p", &owner.public_key().to_hex()]).expect("p tag"),
+                Tag::parse([OBSERVER_AGENT_TAG, &agent.public_key().to_hex()]).expect("agent tag"),
+                Tag::parse([OBSERVER_FRAME_TAG, OBSERVER_FRAME_TELEMETRY]).expect("frame tag"),
+            ])
+            .sign_with_keys(&agent)
+            .expect("sign event");
 
-        let err = super::agent_observer_route(&event).expect_err("route should reject plaintext");
-        assert!(err.contains("NIP-44"));
+        let err =
+            super::agent_observer_route(&event).expect_err("route should reject empty content");
+        assert!(err.contains("non-empty"));
     }
 
     #[tokio::test]
@@ -1425,13 +1417,9 @@ mod tests {
             false,
         );
 
-        let encrypted = encrypt_observer_payload(
-            &agent,
-            &owner.public_key(),
-            &serde_json::json!({"type": "acp_read"}),
-        )
-        .expect("encrypt observer payload");
-        let event = EventBuilder::new(Kind::Custom(KIND_AGENT_OBSERVER_FRAME as u16), encrypted)
+        let content = encode_observer_payload(&serde_json::json!({"type": "acp_read"}))
+            .expect("encode observer payload");
+        let event = EventBuilder::new(Kind::Custom(KIND_AGENT_OBSERVER_FRAME as u16), content)
             .tags([
                 Tag::parse(["p", &owner.public_key().to_hex()]).expect("p tag"),
                 Tag::parse([OBSERVER_AGENT_TAG, &agent.public_key().to_hex()]).expect("agent tag"),

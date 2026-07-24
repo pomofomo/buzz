@@ -1,6 +1,6 @@
 //! Owner-reviewed agent draft requests published through Buzz observer frames.
 
-use buzz_core::observer::{encrypt_observer_payload, OBSERVER_FRAME_TELEMETRY};
+use buzz_core::observer::{encode_observer_payload, OBSERVER_FRAME_TELEMETRY};
 use nostr::{Event, Keys, PublicKey};
 use serde::Serialize;
 
@@ -107,13 +107,13 @@ fn build<T: Serialize>(
             request,
         },
     };
-    let encrypted = encrypt_observer_payload(keys, owner, &payload)
-        .map_err(|error| CliError::Other(format!("could not encrypt draft request: {error}")))?;
+    let content = encode_observer_payload(&payload)
+        .map_err(|error| CliError::Other(format!("could not encode draft request: {error}")))?;
     let event = buzz_sdk::build_agent_observer_frame(
         &owner.to_hex(),
         &keys.public_key().to_hex(),
         OBSERVER_FRAME_TELEMETRY,
-        &encrypted,
+        &content,
     )
     .map_err(|error| CliError::Other(format!("could not build draft request: {error}")))?
     .sign_with_keys(keys)
@@ -188,12 +188,12 @@ pub fn build_update(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use buzz_core::observer::{decrypt_observer_payload, OBSERVER_AGENT_TAG, OBSERVER_FRAME_TAG};
+    use buzz_core::observer::{decode_observer_payload, OBSERVER_AGENT_TAG, OBSERVER_FRAME_TAG};
 
     const CHANNEL: &str = "7c07e659-3610-42f4-9a5e-1e9973c09da9";
 
     #[test]
-    fn create_is_owner_encrypted_and_matches_desktop_contract() {
+    fn create_is_plaintext_and_matches_desktop_contract() {
         let agent = Keys::generate();
         let owner = Keys::generate();
         let built = build_create(
@@ -227,7 +227,7 @@ mod tests {
             .iter()
             .any(|tag| tag.first().map(String::as_str) == Some("h")));
 
-        let payload: serde_json::Value = decrypt_observer_payload(&owner, &built.event).unwrap();
+        let payload: serde_json::Value = decode_observer_payload(&built.event).unwrap();
         assert_eq!(payload["kind"], REQUEST_KIND);
         assert_eq!(payload["channelId"], CHANNEL);
         assert_eq!(payload["payload"]["type"], REQUEST_KIND);

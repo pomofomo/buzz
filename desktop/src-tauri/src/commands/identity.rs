@@ -175,14 +175,10 @@ pub async fn sign_event(
 }
 
 #[tauri::command]
-pub fn decrypt_observer_event(
-    event_json: String,
-    state: State<'_, AppState>,
-) -> Result<serde_json::Value, String> {
-    let keys = state.signing_keys()?;
+pub fn decrypt_observer_event(event_json: String) -> Result<serde_json::Value, String> {
     let event = Event::from_json(event_json).map_err(|error| format!("invalid event: {error}"))?;
 
-    // Defense-in-depth: verify event ID and signature before decrypting.
+    // Defense-in-depth: verify event ID and signature before decoding.
     if !event.verify_id() {
         return Err("observer event has invalid ID".into());
     }
@@ -190,8 +186,10 @@ pub fn decrypt_observer_event(
         return Err("observer event has invalid signature".into());
     }
 
-    buzz_core_pkg::observer::decrypt_observer_payload(&keys, &event)
-        .map_err(|error| format!("decrypt observer event failed: {error}"))
+    // Observer frames now carry plaintext JSON (server-trust model); read access
+    // is enforced by the relay's `#p` gate, not by client-side decryption.
+    buzz_core_pkg::observer::decode_observer_payload(&event)
+        .map_err(|error| format!("decode observer event failed: {error}"))
 }
 
 #[tauri::command]
@@ -204,14 +202,13 @@ pub fn build_observer_control_event(
     let agent_pubkey = PublicKey::from_hex(agent_pubkey.trim())
         .map_err(|error| format!("invalid agent pubkey: {error}"))?;
     let agent_pubkey_hex = agent_pubkey.to_hex();
-    let encrypted =
-        buzz_core_pkg::observer::encrypt_observer_payload(&keys, &agent_pubkey, &payload)
-            .map_err(|error| format!("encrypt observer control failed: {error}"))?;
+    let content = buzz_core_pkg::observer::encode_observer_payload(&payload)
+        .map_err(|error| format!("encode observer control failed: {error}"))?;
     let builder = buzz_sdk_pkg::build_agent_observer_frame(
         &agent_pubkey_hex,
         &agent_pubkey_hex,
         buzz_core_pkg::observer::OBSERVER_FRAME_CONTROL,
-        &encrypted,
+        &content,
     )
     .map_err(|error| format!("build observer control failed: {error}"))?;
     let event = builder

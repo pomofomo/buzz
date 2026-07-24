@@ -5760,17 +5760,13 @@ mod tests {
     /// Build a signed observer telemetry frame (kind 24200) for gate tests.
     fn make_observer_frame(keys: &Keys) -> Event {
         let recipient = Keys::generate();
-        let encrypted = buzz_core::observer::encrypt_observer_payload(
-            keys,
-            &recipient.public_key(),
-            &json!({"type": "test"}),
-        )
-        .expect("encrypt test observer payload");
+        let content = buzz_core::observer::encode_observer_payload(&json!({"type": "test"}))
+            .expect("encode test observer payload");
         buzz_sdk::build_agent_observer_frame(
             &recipient.public_key().to_hex(),
             &keys.public_key().to_hex(),
             "telemetry",
-            &encrypted,
+            &content,
         )
         .expect("build test observer frame")
         .sign_with_keys(keys)

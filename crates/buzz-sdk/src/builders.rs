@@ -15,8 +15,8 @@ use buzz_core::{
         KIND_WORKFLOW_TRIGGER,
     },
     observer::{
-        content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
-        OBSERVER_FRAME_TELEMETRY,
+        content_fits_observer_frame, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL,
+        OBSERVER_FRAME_TAG, OBSERVER_FRAME_TELEMETRY,
     },
 };
 use nostr::{EventBuilder, Kind, Tag};
@@ -237,25 +237,29 @@ pub fn build_message(
     Ok(EventBuilder::new(Kind::Custom(9), content).tags(tags))
 }
 
-/// Build an encrypted agent observer frame (kind 24200).
+/// Build an agent observer frame (kind 24200).
 ///
 /// `recipient_pubkey` is the cleartext `p` tag used by the relay for owner-only
-/// routing. `agent_pubkey` identifies the managed agent whose observer stream
-/// this frame belongs to. `encrypted_content` must be NIP-44 v2 ciphertext.
+/// routing (and the relay's `#p` read gate). `agent_pubkey` identifies the
+/// managed agent whose observer stream this frame belongs to. `content` is
+/// plaintext JSON — client-side encryption was removed in the server-trust
+/// model; confidentiality is enforced by the relay's read gates, not by the
+/// content. `content` must be non-empty and within the observer plaintext
+/// budget.
 pub fn build_agent_observer_frame(
     recipient_pubkey: &str,
     agent_pubkey: &str,
     frame: &str,
-    encrypted_content: &str,
+    content: &str,
 ) -> Result<EventBuilder, SdkError> {
     if frame != OBSERVER_FRAME_TELEMETRY && frame != OBSERVER_FRAME_CONTROL {
         return Err(SdkError::InvalidInput(format!(
             "observer frame must be {OBSERVER_FRAME_TELEMETRY:?} or {OBSERVER_FRAME_CONTROL:?}"
         )));
     }
-    if !content_looks_like_nip44(encrypted_content) {
+    if !content_fits_observer_frame(content) {
         return Err(SdkError::InvalidInput(
-            "observer frame content must be NIP-44 v2 ciphertext".into(),
+            "observer frame content must be non-empty and within the plaintext budget".into(),
         ));
     }
 
@@ -267,11 +271,7 @@ pub fn build_agent_observer_frame(
         tag(&[OBSERVER_FRAME_TAG, frame])?,
     ];
 
-    Ok(EventBuilder::new(
-        Kind::Custom(KIND_AGENT_OBSERVER_FRAME as u16),
-        encrypted_content,
-    )
-    .tags(tags))
+    Ok(EventBuilder::new(Kind::Custom(KIND_AGENT_OBSERVER_FRAME as u16), content).tags(tags))
 }
 
 /// Build a forum post thread root (kind 45001).
@@ -1861,27 +1861,23 @@ mod tests {
 
     #[test]
     fn agent_observer_frame_happy_path() {
-        let sender = keys();
         let recipient = keys();
         let agent = keys();
-        let encrypted = buzz_core::observer::encrypt_observer_payload(
-            &sender,
-            &recipient.public_key(),
-            &serde_json::json!({"type": "acp_read"}),
-        )
-        .unwrap();
+        let content =
+            buzz_core::observer::encode_observer_payload(&serde_json::json!({"type": "acp_read"}))
+                .unwrap();
         let ev = sign(
             build_agent_observer_frame(
                 &recipient.public_key().to_hex(),
                 &agent.public_key().to_hex(),
                 OBSERVER_FRAME_TELEMETRY,
-                &encrypted,
+                &content,
             )
             .unwrap(),
         );
 
         assert_eq!(ev.kind.as_u16(), KIND_AGENT_OBSERVER_FRAME as u16);
-        assert_eq!(ev.content, encrypted);
+        assert_eq!(ev.content, content);
         assert!(has_tag(&ev, "p", &recipient.public_key().to_hex()));
         assert!(has_tag(
             &ev,
@@ -1892,12 +1888,12 @@ mod tests {
     }
 
     #[test]
-    fn agent_observer_frame_rejects_plaintext_content() {
+    fn agent_observer_frame_rejects_empty_content() {
         let err = build_agent_observer_frame(
             &"a".repeat(64),
             &"b".repeat(64),
             OBSERVER_FRAME_TELEMETRY,
-            "not encrypted",
+            "",
         )
         .unwrap_err();
         assert!(matches!(err, SdkError::InvalidInput(_)));
