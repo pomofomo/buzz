@@ -433,19 +433,23 @@ async fn main() -> anyhow::Result<()> {
     );
     let state = Arc::new(app_state);
 
-    // TODO(Lane F — audit WORM anchoring): spawn the external head-hash anchor
-    // worker here once the auth-refactor lanes settle. It is intentionally NOT
-    // wired yet to avoid startup/state merge conflicts with in-flight lanes.
-    // The worker is off unless BUZZ_AUDIT_ANCHOR_ENABLED=true, so leaving it
-    // unspawned is a no-op. To enable, add (needs a `PgPool` — e.g. the pool
-    // backing `db`/`audit` — and the graceful-shutdown cancellation token):
-    //
-    //     let anchor_cfg = buzz_audit::AnchorConfig::from_env();
-    //     let anchor_handle = buzz_audit::spawn_anchor_worker(
-    //         pool.clone(), anchor_cfg, shutdown_token.cancelled_owned());
-    //
-    // then await `anchor_handle` alongside `audit_shutdown.drain(...)` during
-    // graceful shutdown so the final anchor flushes before exit.
+    // Lane F — audit WORM anchoring: periodic head-hash export to an external
+    // WORM bucket. Off unless BUZZ_AUDIT_ANCHOR_ENABLED=true; the worker owns a
+    // small dedicated pool (mirroring the audit pool) so anchor sweeps never
+    // compete with request-path connections. It listens for the same
+    // SIGTERM/ctrl-c the server drains on and performs a final sweep before the
+    // 30s drain window forces exit.
+    let anchor_cfg = buzz_audit::AnchorConfig::from_env();
+    if anchor_cfg.enabled {
+        let anchor_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .min_connections(1)
+            .connect(&config.database_url)
+            .await
+            .map_err(|e| anyhow::anyhow!("Audit anchor DB connection failed: {e}"))?;
+        buzz_audit::spawn_anchor_worker(anchor_pool, anchor_cfg, shutdown_signal());
+        info!("Audit WORM anchor worker started");
+    }
 
     // Inter-relay mesh (BUZZ_MESH seam). `boot_mesh` returns None when the
     // kill switch is off — nothing is bound, published, or spawned, so the
