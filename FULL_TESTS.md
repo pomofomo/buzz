@@ -1,5 +1,19 @@
 # FULL_TESTS.md — Finishing the Nostr → API-key migration in a full environment
 
+> **STATUS (2026-07-24): COMPLETE.** All items in §5 were executed and are green
+> on a full local environment: §5.A integration suite (2 refactor bugs fixed),
+> §5.B root-caused and FIXED (timestamptz microsecond truncation vs nanosecond
+> hashing in `AuditService::log`; quarantine lifted), §5.C mobile green
+> (analyze clean, 497 tests, 10 test files rewritten), §5.D Playwright green
+> (801/830 mock-bridge + 161/162 relay-backed integration; suite must be built
+> with `pnpm run build:e2e`), §5.E desktop nip44 removal done (agent
+> observer/turn-metric crypto deferred — encrypting end lives in agent crates),
+> §5.F smoke passed incl. revocation. Additionally the invite mint/claim
+> endpoints were ported to apikey mode (claim self-mints a member key for a
+> fresh actor — see `crates/buzz-relay/src/api/invites.rs`). `just ci` passes.
+> Remaining before cutover: §5.G (operational), and the cross-crate agent
+> observer/turn-metric encryption lane.
+
 This branch (`claude/nostr-api-keys-refactor-06pyto`) implements the
 Nostr-substrate → API-key migration described in [REFACTOR.md](REFACTOR.md). The
 core and server work was done and verified in a **restricted sandbox** (no
