@@ -1,6 +1,4 @@
-use nostr::{
-    nips::nip44, Event, EventBuilder, JsonUtil, Keys, Kind, PublicKey, Tag, Timestamp, ToBech32,
-};
+use nostr::{Event, EventBuilder, JsonUtil, Keys, Kind, PublicKey, Tag, Timestamp, ToBech32};
 use tauri::Manager;
 use tauri::State;
 
@@ -501,41 +499,6 @@ pub async fn create_auth_event(
             .map_err(|error| format!("sign failed: {error}"))?;
 
         Ok(event.as_json())
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking failed: {e}"))?
-}
-
-#[tauri::command]
-pub async fn nip44_encrypt_to_self(
-    plaintext: String,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
-    let keys = state.signing_keys()?;
-
-    tauri::async_runtime::spawn_blocking(move || {
-        nip44::encrypt(
-            keys.secret_key(),
-            &keys.public_key(),
-            &plaintext,
-            nip44::Version::V2,
-        )
-        .map_err(|e| format!("nip44 encrypt failed: {e}"))
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking failed: {e}"))?
-}
-
-#[tauri::command]
-pub async fn nip44_decrypt_from_self(
-    ciphertext: String,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
-    let keys = state.signing_keys()?;
-
-    tauri::async_runtime::spawn_blocking(move || {
-        nip44::decrypt(keys.secret_key(), &keys.public_key(), &ciphertext)
-            .map_err(|e| format!("nip44 decrypt failed: {e}"))
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?

@@ -1,9 +1,5 @@
 import { relayClient } from "@/shared/api/relayClient";
-import {
-  nip44DecryptFromSelf,
-  nip44EncryptToSelf,
-  signRelayEvent,
-} from "@/shared/api/tauri";
+import { signRelayEvent } from "@/shared/api/tauri";
 import type { RelayEvent } from "@/shared/api/types";
 import { KIND_CHANNEL_SORT } from "@/shared/constants/kinds";
 import {
@@ -20,12 +16,12 @@ export type RemoteSortPrefs = {
   eventId: string;
 };
 
-async function decryptAndParse(
-  event: RelayEvent,
-): Promise<RemoteSortPrefs | null> {
+// Content is stored as plaintext JSON. Legacy rows written before E2E removal
+// hold NIP-44 ciphertext; JSON.parse throws on them and we treat the record as
+// absent (returns null) — no decrypt fallback.
+function parseRemoteSort(event: RelayEvent): RemoteSortPrefs | null {
   try {
-    const plaintext = await nip44DecryptFromSelf(event.content);
-    const store = parseChannelSortPayload(JSON.parse(plaintext));
+    const store = parseChannelSortPayload(JSON.parse(event.content));
     if (!store) return null;
     return { store, createdAt: event.created_at, eventId: event.id };
   } catch {
@@ -64,7 +60,7 @@ export class ChannelSortSyncManager {
       });
       if (events.length === 0) return null;
       if (events[0].pubkey !== this.pubkey) return null;
-      const result = await decryptAndParse(events[0]);
+      const result = parseRemoteSort(events[0]);
       if (result) {
         this.lastRemoteCreatedAt = Math.max(
           this.lastRemoteCreatedAt,
@@ -110,7 +106,7 @@ export class ChannelSortSyncManager {
         limit: 1,
       });
       if (events.length === 0 || events[0].pubkey !== this.pubkey) return store;
-      const remote = await decryptAndParse(events[0]);
+      const remote = parseRemoteSort(events[0]);
       if (!remote) return store;
       // Sort prefs use whole-blob LWW: take whichever is newer
       if (remote.createdAt > this.lastRemoteCreatedAt) {
@@ -151,14 +147,14 @@ export class ChannelSortSyncManager {
         version: 1,
         groups: merged.groups,
       };
-      const ciphertext = await nip44EncryptToSelf(JSON.stringify(payload));
+      const content = JSON.stringify(payload);
       const createdAt = Math.max(
         Math.floor(Date.now() / 1_000),
         this.lastRemoteCreatedAt + 1,
       );
       const event = await signRelayEvent({
         kind: KIND_CHANNEL_SORT,
-        content: ciphertext,
+        content,
         createdAt,
         tags: [
           ["d", D_TAG],
@@ -197,15 +193,14 @@ export class ChannelSortSyncManager {
       },
       (event: RelayEvent) => {
         if (event.pubkey !== this.pubkey) return;
-        void decryptAndParse(event).then((result) => {
-          if (result) {
-            this.lastRemoteCreatedAt = Math.max(
-              this.lastRemoteCreatedAt,
-              result.createdAt,
-            );
-            onUpdate(result);
-          }
-        });
+        const result = parseRemoteSort(event);
+        if (result) {
+          this.lastRemoteCreatedAt = Math.max(
+            this.lastRemoteCreatedAt,
+            result.createdAt,
+          );
+          onUpdate(result);
+        }
       },
     );
   }

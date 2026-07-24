@@ -1,4 +1,4 @@
-import { nip44EncryptToSelf, signRelayEvent } from "@/shared/api/tauri";
+import { signRelayEvent } from "@/shared/api/tauri";
 import type { RelayClient } from "@/shared/api/relayClientSession";
 import type { RelayEvent } from "@/shared/api/types";
 import { KIND_READ_STATE } from "@/shared/constants/kinds";
@@ -483,7 +483,7 @@ export class ReadStateManager {
     >();
 
     for (const event of events) {
-      const parsed = await parseReadStateEvent(event, this.pubkey);
+      const parsed = parseReadStateEvent(event, this.pubkey);
       if (!parsed) continue;
 
       this.maxFetchedCreatedAt = Math.max(
@@ -519,7 +519,7 @@ export class ReadStateManager {
     // Conflict detection: check if another client_id is squatting on our
     // d-tag coordinate. If so, rotate our slotId to avoid clobbering.
     for (const event of events) {
-      const parsed = await parseReadStateEvent(event, this.pubkey);
+      const parsed = parseReadStateEvent(event, this.pubkey);
       if (!parsed || parsed.dTag !== `read-state:${this.slotId}`) continue;
       if (parsed.blob.client_id !== this.clientId) {
         this.slotId = generateHex(16);
@@ -578,7 +578,7 @@ export class ReadStateManager {
       `[ReadStateManager] incoming event=${event.id.substring(0, 8)}… created_at=${event.created_at}`,
     );
 
-    const parsed = await parseReadStateEvent(event, this.pubkey);
+    const parsed = parseReadStateEvent(event, this.pubkey);
     if (!parsed) return;
 
     this.maxFetchedCreatedAt = Math.max(
@@ -676,8 +676,7 @@ export class ReadStateManager {
     };
 
     try {
-      const plaintext = JSON.stringify(blob);
-      const ciphertext = await nip44EncryptToSelf(plaintext);
+      const content = JSON.stringify(blob);
 
       const dTagValue = `read-state:${slotId}`;
       const tags: string[][] = [
@@ -691,7 +690,7 @@ export class ReadStateManager {
       );
       const event = await signRelayEvent({
         kind: KIND_READ_STATE,
-        content: ciphertext,
+        content,
         createdAt,
         tags,
       });

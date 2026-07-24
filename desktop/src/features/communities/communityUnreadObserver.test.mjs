@@ -47,7 +47,7 @@ function relayFor(filters) {
   };
 }
 
-// Helper: encode a mutes payload as JSON (decryptMutes stub returns content as-is)
+// Helper: encode a mutes payload as plaintext JSON (event content is read directly).
 function mutesContent(mutedIds) {
   const channels = {};
   for (const id of mutedIds) {
@@ -173,8 +173,6 @@ test("fetchCommunityUnread returns dot and mention count without total unread co
     client: relay,
     pubkey: PUBKEY,
     nowSeconds: 100,
-    decryptReadState: async (value) => value,
-    decryptMutes: async (value) => value,
     readThreadRelationships: readRelationships(),
   });
 
@@ -255,8 +253,6 @@ test("fetchCommunityUnread ignores self-authored and read thread/message events"
     client: relay,
     pubkey: PUBKEY,
     nowSeconds: 100,
-    decryptReadState: async (value) => value,
-    decryptMutes: async (value) => value,
     readThreadRelationships: readRelationships(),
   });
 
@@ -303,8 +299,6 @@ test("fetchCommunityUnread excludes muted-only channel — returns hasUnread:fal
     client: relay,
     pubkey: PUBKEY,
     nowSeconds: 100,
-    decryptReadState: async (value) => value,
-    decryptMutes: async (value) => value,
     readThreadRelationships: readRelationships(),
   });
 
@@ -377,15 +371,13 @@ test("fetchCommunityUnread counts unmuted channel but skips muted channel", asyn
     client: relay,
     pubkey: PUBKEY,
     nowSeconds: 100,
-    decryptReadState: async (value) => value,
-    decryptMutes: async (value) => value,
     readThreadRelationships: readRelationships(),
   });
 
   assert.deepEqual(result, { hasUnread: true, mentionCount: 1 });
 });
 
-test("fetchCommunityUnread treats decryption failure as empty mutes set", async () => {
+test("fetchCommunityUnread treats malformed mutes content as empty mutes set", async () => {
   const relay = relayFor([
     // 1. member events
     () => [
@@ -409,14 +401,15 @@ test("fetchCommunityUnread treats decryption failure as empty mutes set", async 
     () => [],
     // 4. read-state events (parallel with mutes)
     () => [],
-    // 5. mutes events — present but decryption will throw
+    // 5. mutes events — present but content is not valid JSON (e.g. legacy
+    //    NIP-44 ciphertext); JSON.parse throws → treated as empty mutes set
     () => [
       event({
         pubkey: PUBKEY,
         content: "corrupted-ciphertext",
       }),
     ],
-    // 6. unread events — channel is NOT muted (decryption failed → empty set)
+    // 6. unread events — channel is NOT muted (malformed mutes → empty set)
     () => [
       event({
         id: "unread".padEnd(64, "0"),
@@ -432,10 +425,6 @@ test("fetchCommunityUnread treats decryption failure as empty mutes set", async 
     client: relay,
     pubkey: PUBKEY,
     nowSeconds: 100,
-    decryptReadState: async (value) => value,
-    decryptMutes: async () => {
-      throw new Error("decryption failed");
-    },
     readThreadRelationships: readRelationships(),
   });
 
@@ -485,8 +474,6 @@ test("fetchCommunityUnread treats absent mutes blob as empty mutes set", async (
     client: relay,
     pubkey: PUBKEY,
     nowSeconds: 100,
-    decryptReadState: async (value) => value,
-    decryptMutes: async (value) => value,
     readThreadRelationships: readRelationships(),
   });
 
@@ -551,8 +538,6 @@ test("fetchCommunityUnread threaded reply in untracked root → hasUnread:false"
     client: relay,
     pubkey: PUBKEY,
     nowSeconds: 100,
-    decryptReadState: async (v) => v,
-    decryptMutes: async (v) => v,
     // No root in any set → gate rejects the threaded reply
     readThreadRelationships: readRelationships(),
   });
@@ -567,8 +552,6 @@ test("fetchCommunityUnread threaded reply in participatedRootIds → hasUnread:t
     client: relay,
     pubkey: PUBKEY,
     nowSeconds: 100,
-    decryptReadState: async (v) => v,
-    decryptMutes: async (v) => v,
     readThreadRelationships: readRelationships({
       participatedRootIds: new Set([THREAD_ROOT_2]),
     }),
@@ -590,8 +573,6 @@ test("fetchCommunityUnread #p-mention reply in untracked root → hasUnread:true
     client: relay,
     pubkey: PUBKEY,
     nowSeconds: 100,
-    decryptReadState: async (v) => v,
-    decryptMutes: async (v) => v,
     readThreadRelationships: readRelationships(),
   });
 
@@ -612,8 +593,6 @@ test("fetchCommunityUnread top-level post → hasUnread:true (no thread gate)", 
     client: relay,
     pubkey: PUBKEY,
     nowSeconds: 100,
-    decryptReadState: async (v) => v,
-    decryptMutes: async (v) => v,
     readThreadRelationships: readRelationships(),
   });
 
@@ -629,8 +608,6 @@ test("fetchCommunityUnread threaded reply whose root is in mutedRootIds → hasU
     client: relay,
     pubkey: PUBKEY,
     nowSeconds: 100,
-    decryptReadState: async (v) => v,
-    decryptMutes: async (v) => v,
     // Root is participated but also muted — mute wins
     readThreadRelationships: readRelationships({
       participatedRootIds: new Set([THREAD_ROOT_2]),
@@ -734,8 +711,6 @@ test("fetchCommunityUnread forced-unread channel lights rail dot (hasUnread:true
     client: relay,
     pubkey: PUBKEY,
     nowSeconds: 100,
-    decryptReadState: async (v) => v,
-    decryptMutes: async (v) => v,
     readThreadRelationships: readRelationships(),
     // Forced-unread map: CHANNEL_ID forced when marker was null (no prior read)
     readForcedUnread: () => ({ [CHANNEL_ID]: null }),
@@ -756,8 +731,6 @@ test("fetchCommunityUnread forced-unread channel not in member list → hasUnrea
     client: relay,
     pubkey: PUBKEY,
     nowSeconds: 100,
-    decryptReadState: async (v) => v,
-    decryptMutes: async (v) => v,
     readThreadRelationships: readRelationships(),
     readForcedUnread: () => ({ [CHANNEL_ID]: null }),
   });
@@ -803,8 +776,6 @@ test("fetchCommunityUnread forced-unread channel that is also muted → hasUnrea
     client: relay,
     pubkey: PUBKEY,
     nowSeconds: 100,
-    decryptReadState: async (v) => v,
-    decryptMutes: async (v) => v,
     readThreadRelationships: readRelationships(),
     // CHANNEL_ID is both forced-unread AND muted — mute wins
     readForcedUnread: () => ({ [CHANNEL_ID]: null }),
@@ -856,8 +827,6 @@ test("fetchCommunityUnread readForcedUnread returns empty map → falls through 
     client: relay,
     pubkey: PUBKEY,
     nowSeconds: 100,
-    decryptReadState: async (v) => v,
-    decryptMutes: async (v) => v,
     readThreadRelationships: readRelationships(),
     readForcedUnread: () => ({}), // empty — no forced-unread
   });
@@ -873,8 +842,6 @@ test("fetchCommunityUnread forced-unread + synced marker advanced PAST baseline 
     client: relay,
     pubkey: PUBKEY,
     nowSeconds: 200,
-    decryptReadState: async (v) => v,
-    decryptMutes: async (v) => v,
     readThreadRelationships: readRelationships(),
     // Forced at marker=50; synced marker is now 100 — covers the force
     readForcedUnread: () => ({ [CHANNEL_ID]: 50 }),
@@ -891,8 +858,6 @@ test("fetchCommunityUnread forced-unread + synced marker NOT advanced past basel
     client: relay,
     pubkey: PUBKEY,
     nowSeconds: 200,
-    decryptReadState: async (v) => v,
-    decryptMutes: async (v) => v,
     readThreadRelationships: readRelationships(),
     // Forced at marker=100; synced marker is still 100 — no newer read
     readForcedUnread: () => ({ [CHANNEL_ID]: 100 }),
@@ -910,8 +875,6 @@ test("fetchCommunityUnread forced-unread with null baseline + synced marker pres
     client: relay,
     pubkey: PUBKEY,
     nowSeconds: 200,
-    decryptReadState: async (v) => v,
-    decryptMutes: async (v) => v,
     readThreadRelationships: readRelationships(),
     // Forced when no marker existed; a cross-device read has since appeared
     readForcedUnread: () => ({ [CHANNEL_ID]: null }),

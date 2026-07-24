@@ -551,7 +551,7 @@ test("publishSplitSlots_noopSuppression_skipsWhenUnchanged", async () => {
 
   // Replace publishOneSlot with a stub that records calls and simulates the
   // lastPublishedContexts merge (the only side-effect the no-op check depends
-  // on). This avoids tauri (nip44EncryptToSelf / signRelayEvent) while keeping
+  // on). This avoids tauri (signRelayEvent) while keeping
   // the suppression logic under test.
   let publishOneSlotCallCount = 0;
   mgr.publishOneSlot = async (_slotId, contexts) => {

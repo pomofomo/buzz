@@ -21,7 +21,6 @@ import {
 import type { Community } from "@/features/communities/types";
 import { withReadOnlyRelayClient } from "@/shared/api/readOnlyRelayClient";
 import type { RelaySubscriptionFilter } from "@/shared/api/relayClientShared";
-import { nip44DecryptFromSelf } from "@/shared/api/tauri";
 import type { ChannelType, RelayEvent } from "@/shared/api/types";
 import {
   CHANNEL_MESSAGE_EVENT_KINDS,
@@ -156,15 +155,12 @@ export async function fetchCommunityUnread(args: {
   client: CommunityUnreadRelay;
   pubkey: string;
   nowSeconds?: number;
-  decryptReadState?: (ciphertext: string) => Promise<string>;
-  decryptMutes?: (ciphertext: string) => Promise<string>;
   readThreadRelationships?: (pubkey: string) => ThreadRelationships;
   readForcedUnread?: (pubkey: string) => ForcedUnreadMap;
 }): Promise<CommunityUnreadObserverResult> {
   const { client, pubkey } = args;
   const normalizedPubkey = pubkey.toLowerCase();
   const nowSeconds = args.nowSeconds ?? Math.floor(Date.now() / 1_000);
-  const decryptMutes = args.decryptMutes ?? nip44DecryptFromSelf;
   const readRelationships =
     args.readThreadRelationships ?? defaultReadThreadRelationships;
   const readForcedUnread =
@@ -191,22 +187,19 @@ export async function fetchCommunityUnread(args: {
     }),
   ]);
 
-  const readState = await mergeReadStateEvents(
-    readStateEvents,
-    pubkey,
-    args.decryptReadState,
-  );
+  const readState = mergeReadStateEvents(readStateEvents, pubkey);
 
   let mutedIds = new Set<string>();
   if (mutesEvents.length > 0) {
     try {
-      const plaintext = await decryptMutes(mutesEvents[0].content);
-      const store = parseMutePayload(JSON.parse(plaintext));
+      // Plaintext JSON; legacy NIP-44 ciphertext throws in JSON.parse and is
+      // treated as an empty mutes set.
+      const store = parseMutePayload(JSON.parse(mutesEvents[0].content));
       if (store) {
         mutedIds = mutedChannelIdsFromStore(store);
       }
     } catch {
-      // decryption failure → treat as empty mutes set
+      // malformed content → treat as empty mutes set
     }
   }
 

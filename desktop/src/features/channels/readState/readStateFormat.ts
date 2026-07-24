@@ -15,10 +15,12 @@ export const MAX_CONTEXTS = 10_000;
 // beyond it is local-only dead weight that other devices never see anyway.
 export const LOCAL_MAX_PRUNABLE_CONTEXTS = 1_000;
 
-// Maximum plaintext byte length for the JSON blob passed to nip44EncryptToSelf.
-// NIP-44 v2 hard-caps plaintext at 65,535 bytes; the relay enforces a 256 KB
-// content limit. 32 KB gives ample headroom for NIP-44 overhead (~1.4×
-// expansion to ~45 KB ciphertext) while keeping the blob well under both caps.
+// Maximum byte length for a single read-state JSON blob. The blob is now stored
+// as plaintext event content (E2E encryption dropped — see REFACTOR.md decision
+// #5), so it goes to the relay verbatim. The relay enforces a 256 KB content
+// limit; this 32 KB per-slot cap keeps each blob well under that with generous
+// headroom, and drives the multi-slot split (READ_STATE_MAX_SLOTS) for users
+// with more channel keys than one slot can hold.
 export const READ_STATE_MAX_PLAINTEXT_BYTES = 32_768;
 
 // Maximum number of slots a client may publish. Each slot is a separate

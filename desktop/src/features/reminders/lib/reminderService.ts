@@ -1,9 +1,5 @@
 import { relayClient } from "@/shared/api/relayClient";
-import {
-  nip44DecryptFromSelf,
-  nip44EncryptToSelf,
-  signRelayEvent,
-} from "@/shared/api/tauri";
+import { signRelayEvent } from "@/shared/api/tauri";
 import type { RelayEvent } from "@/shared/api/types";
 import { KIND_EVENT_REMINDER } from "@/shared/constants/kinds";
 import type {
@@ -50,7 +46,7 @@ export function parseNotBefore(raw: string): number | undefined {
 }
 
 /**
- * Validate decrypted reminder plaintext against the shape this client writes,
+ * Validate reminder content plaintext against the shape this client writes,
  * returning a typed content object or null. NIP-ER (Content section) requires
  * clients to ignore plaintext that is not a JSON object, has an unknown
  * `status`, or has a malformed target/note — so anything off-shape fails closed.
@@ -114,19 +110,15 @@ function parseTarget(value: unknown): ReminderTarget | null {
   };
 }
 
-async function decryptReminder(event: RelayEvent): Promise<Reminder | null> {
+// Reminder content is stored as plaintext JSON. `parseReminderContent` fails
+// closed (returns null) on anything off-shape — including legacy NIP-44
+// ciphertext written before E2E removal, whose JSON.parse throws — so such
+// records are simply treated as absent with no decrypt fallback.
+function parseReminderEvent(event: RelayEvent): Reminder | null {
   const dTag = extractDTag(event);
   if (!dTag) return null;
 
-  let plaintext: string;
-  try {
-    plaintext = await nip44DecryptFromSelf(event.content);
-  } catch {
-    console.warn("[reminderService] failed to decrypt reminder:", event.id);
-    return null;
-  }
-
-  const content = parseReminderContent(plaintext);
+  const content = parseReminderContent(event.content);
   if (!content) {
     console.warn("[reminderService] ignoring malformed reminder:", event.id);
     return null;
@@ -148,8 +140,9 @@ export async function fetchReminders(pubkey: string): Promise<Reminder[]> {
     limit: 200,
   });
 
-  const results = await Promise.all(events.map(decryptReminder));
-  return results.filter((r): r is Reminder => r !== null);
+  return events
+    .map(parseReminderEvent)
+    .filter((r): r is Reminder => r !== null);
 }
 
 export async function createReminder(
@@ -164,7 +157,7 @@ export async function createReminder(
     status: "pending",
   };
 
-  const ciphertext = await nip44EncryptToSelf(JSON.stringify(content));
+  const serialized = JSON.stringify(content);
   const tags: string[][] = [
     ["d", dTag],
     ["not_before", String(notBefore)],
@@ -172,7 +165,7 @@ export async function createReminder(
 
   const event = await signRelayEvent({
     kind: KIND_EVENT_REMINDER,
-    content: ciphertext,
+    content: serialized,
     tags,
   });
 
@@ -192,7 +185,7 @@ export async function completeReminder(
     status: "done",
   };
 
-  const ciphertext = await nip44EncryptToSelf(JSON.stringify(content));
+  const serialized = JSON.stringify(content);
   const expiration = jitteredExpiration();
   const tags: string[][] = [
     ["d", reminder.id],
@@ -201,7 +194,7 @@ export async function completeReminder(
 
   const event = await signRelayEvent({
     kind: KIND_EVENT_REMINDER,
-    content: ciphertext,
+    content: serialized,
     createdAt: Math.max(Math.floor(Date.now() / 1_000), reminder.createdAt + 1),
     tags,
   });
@@ -223,7 +216,7 @@ export async function snoozeReminder(
     status: "pending",
   };
 
-  const ciphertext = await nip44EncryptToSelf(JSON.stringify(content));
+  const serialized = JSON.stringify(content);
   const tags: string[][] = [
     ["d", reminder.id],
     ["not_before", String(newNotBefore)],
@@ -231,7 +224,7 @@ export async function snoozeReminder(
 
   const event = await signRelayEvent({
     kind: KIND_EVENT_REMINDER,
-    content: ciphertext,
+    content: serialized,
     createdAt: Math.max(Math.floor(Date.now() / 1_000), reminder.createdAt + 1),
     tags,
   });
@@ -252,7 +245,7 @@ export async function cancelReminder(
     status: "cancelled",
   };
 
-  const ciphertext = await nip44EncryptToSelf(JSON.stringify(content));
+  const serialized = JSON.stringify(content);
   const expiration = jitteredExpiration();
   const tags: string[][] = [
     ["d", reminder.id],
@@ -261,7 +254,7 @@ export async function cancelReminder(
 
   const event = await signRelayEvent({
     kind: KIND_EVENT_REMINDER,
-    content: ciphertext,
+    content: serialized,
     createdAt: Math.max(Math.floor(Date.now() / 1_000), reminder.createdAt + 1),
     tags,
   });

@@ -3,7 +3,7 @@ import type { Community } from "@/features/communities/types";
 import { fetchObservedChannels } from "@/features/communities/communityUnreadObserver";
 import { withReadOnlyRelayClient } from "@/shared/api/readOnlyRelayClient";
 import type { RelaySubscriptionFilter } from "@/shared/api/relayClientShared";
-import { nip44EncryptToSelf, signRelayEvent } from "@/shared/api/tauri";
+import { signRelayEvent } from "@/shared/api/tauri";
 import type { RelayEvent } from "@/shared/api/types";
 import { KIND_READ_STATE } from "@/shared/constants/kinds";
 import { setLocalStorageItemWithRecovery } from "@/shared/lib/localStorageQuota";
@@ -78,11 +78,9 @@ export async function publishCommunityReadState(args: {
   pubkey: string;
   relayUrl: string;
   nowSeconds?: number;
-  encrypt?: (plaintext: string) => Promise<string>;
   sign?: SignEvent;
 }): Promise<void> {
   const { client, pubkey, relayUrl } = args;
-  const encrypt = args.encrypt ?? nip44EncryptToSelf;
   const sign = args.sign ?? signRelayEvent;
   const nowSeconds = args.nowSeconds ?? Math.floor(Date.now() / 1_000);
 
@@ -100,12 +98,14 @@ export async function publishCommunityReadState(args: {
     const slotId = persistedId(
       `${OBSERVER_SLOT_ID_KEY_PREFIX}:${pubkey}:${relayUrl}:${index}`,
     );
-    const ciphertext = await encrypt(
-      JSON.stringify({ v: 1, client_id: clientId, contexts: chunks[index] }),
-    );
+    const content = JSON.stringify({
+      v: 1,
+      client_id: clientId,
+      contexts: chunks[index],
+    });
     const event = await sign({
       kind: KIND_READ_STATE,
-      content: ciphertext,
+      content,
       createdAt: nowSeconds,
       tags: [
         ["d", `read-state:${slotId}`],

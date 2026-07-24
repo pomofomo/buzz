@@ -1078,18 +1078,6 @@ export async function probeBackendProvider(
   });
 }
 
-// ── NIP-44 encrypt-to-self ───────────────────────────────────────────────────
-
-export async function nip44EncryptToSelf(plaintext: string): Promise<string> {
-  return invokeTauri<string>("nip44_encrypt_to_self", { plaintext });
-}
-
-export async function nip44DecryptFromSelf(
-  ciphertext: string,
-): Promise<string> {
-  return invokeTauri<string>("nip44_decrypt_from_self", { ciphertext });
-}
-
 export async function applyCommunity(
   relayUrl: string,
   nsec?: string,
