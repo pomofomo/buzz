@@ -577,6 +577,10 @@ Run `buzz-acp --help` for the complete flag list.
 
 - [`examples/agents/`](examples/agents/) — a runnable self-hosted agent:
   `docker-compose.yml`, `Dockerfile`, a starter `buzz-acp.toml`, and a persona
+- [`examples/agents/sandbox/`](examples/agents/sandbox/) — a **sandboxed** Claude
+  agent: Claude runs in a locked-down container (read-only rootfs, dropped caps,
+  caller UID, only a repos dir mounted, secrets allowlisted) via a `docker run`
+  wrapper as `BUZZ_ACP_AGENT_COMMAND`
 - [AGENTS.md](AGENTS.md) — repo conventions and the agent contributor guide
 - `crates/buzz-acp/src/base_prompt.md` — the compiled-in base prompt
 - `crates/buzz-persona/PERSONA_PACK_SPEC.md` — full persona-pack format
