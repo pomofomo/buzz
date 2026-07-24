@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use futures_util::FutureExt as _;
 use sqlx::{Acquire, PgPool, Row};
 use tracing::{debug, instrument, warn};
@@ -100,7 +100,15 @@ impl AuditService {
         };
         let seq = prev_seq + 1;
 
-        let created_at: DateTime<Utc> = Utc::now();
+        // Truncate to microsecond precision *before* hashing. The chain hash
+        // covers `created_at.to_rfc3339()`, but the stored column is Postgres
+        // `timestamptz`, which has only microsecond resolution. Hashing the raw
+        // `Utc::now()` (nanosecond precision) would bake in sub-microsecond
+        // digits that Postgres drops on write, so the value re-read by
+        // `verify_chain` would hash differently and every chain would fail to
+        // verify. Truncating here makes the hashed value identical to the one
+        // that survives the round-trip.
+        let created_at: DateTime<Utc> = Utc::now().trunc_subsecs(6);
 
         let mut audit_entry = AuditEntry {
             community_id,
@@ -367,7 +375,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "pre-existing failure under real Postgres — under review (Lane M)"]
+    #[ignore = "requires Postgres"]
     async fn chain_links_within_one_community() {
         let _g = db_lock().lock().await;
         let Some(pool) = test_pool().await else {
@@ -405,7 +413,7 @@ mod tests {
     /// starts at seq 1; interleaving writes does not link them; verifying one
     /// never traverses the other.
     #[tokio::test]
-    #[ignore = "pre-existing failure under real Postgres — under review (Lane M)"]
+    #[ignore = "requires Postgres"]
     async fn chains_are_independent_per_community() {
         let _g = db_lock().lock().await;
         let Some(pool) = test_pool().await else {
@@ -466,7 +474,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "pre-existing failure under real Postgres — under review (Lane M)"]
+    #[ignore = "requires Postgres"]
     async fn verify_detects_tampering_within_a_community() {
         let _g = db_lock().lock().await;
         let Some(pool) = test_pool().await else {
@@ -555,7 +563,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "pre-existing failure under real Postgres — under review (Lane M)"]
+    #[ignore = "requires Postgres"]
     async fn cutover_genesis_appends_and_chains() {
         let _g = db_lock().lock().await;
         let Some(pool) = test_pool().await else {
