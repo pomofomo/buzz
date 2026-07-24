@@ -1,6 +1,8 @@
 import * as React from "react";
 import type { VListHandle } from "virtua";
 
+import { markProgrammaticScroll } from "@/shared/lib/programmaticScroll";
+
 const BOTTOM_EPSILON_PX = 1;
 const SETTLE_DEADLINE_MS = 250;
 
@@ -45,6 +47,11 @@ export function useVirtualizedBottomSettle(
         cancel();
         return;
       }
+      // This scrollTo is app-driven (re-pinning to the bottom as a freshly
+      // arrived row's real height settles), not a user scroll — flag it so
+      // scroll-driven dismiss handlers (e.g. media context menus) don't
+      // mistake it for the user scrolling away. See `programmaticScroll.ts`.
+      markProgrammaticScroll();
       listRef.current?.scrollToIndex(lastIndex, { align: "end" });
       const atBottom =
         scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop <=

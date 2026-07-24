@@ -976,8 +976,26 @@ test("right-click menus expose distinct selectors for links, relay video, and of
     sha: MENU_RELAY_VIDEO_SHA,
     filename: "relay-clip.mp4",
   });
-  const relayPlayer = page.getByTestId("video-player").last();
+  // Scope to the row whose <video> src carries this message's SHA, rather
+  // than `.last()`: the virtualized list's DOM child order isn't guaranteed
+  // to track message-arrival order (recycled/reordered nodes), so `.last()`
+  // can resolve to a *different* row than the one this message just produced
+  // — including a still-mounted earlier video whose own context menu then
+  // reopens under a selector meant for this one. Matching on the SHA (stable
+  // across the relay's URL rewrite/proxy, unlike the full URL) identifies
+  // the right row unambiguously regardless of DOM position.
+  const relayPlayer = page
+    .getByTestId("video-player")
+    .filter({ has: page.locator(`video[src*="${MENU_RELAY_VIDEO_SHA}"]`) });
   await expect(relayPlayer).toBeVisible();
+  // Settle the row's position before clicking: the timeline keeps a
+  // freshly-arrived row pinned to the bottom for a short window after it
+  // mounts (`useVirtualizedBottomSettle`), and a `force` click's coordinate
+  // is read at click time — if the row is still mid-correction, the point can
+  // land elsewhere entirely (observed hitting the message composer). This
+  // mirrors the `scrollIntoViewIfNeeded()` already used for the link case
+  // above, which settles position before its own right-click.
+  await relayPlayer.scrollIntoViewIfNeeded();
   // Right-click the player surface. `force` skips the actionability guard: the
   // Play-button overlay sits above the video, but the contextmenu event still
   // capture-bubbles to the surface handler that opens the menu.
@@ -1022,8 +1040,14 @@ test("right-click menus expose distinct selectors for links, relay video, and of
     sha: MENU_OFF_RELAY_VIDEO_SHA,
     filename: "external-clip.mp4",
   });
-  const offRelayPlayer = page.getByTestId("video-player").last();
+  // See the matching comment above: scope by this message's own SHA rather
+  // than `.last()`, so it can only resolve to the off-relay row.
+  const offRelayPlayer = page.getByTestId("video-player").filter({
+    has: page.locator(`video[src*="${MENU_OFF_RELAY_VIDEO_SHA}"]`),
+  });
   await expect(offRelayPlayer).toBeVisible();
+  // See the matching comment above.
+  await offRelayPlayer.scrollIntoViewIfNeeded();
   await offRelayPlayer.click({ button: "right", force: true });
 
   const offRelayMenu = page.locator("[data-video-context-menu]");

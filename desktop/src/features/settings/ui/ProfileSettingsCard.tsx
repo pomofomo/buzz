@@ -233,6 +233,20 @@ export function ProfileSettingsCard({
     string | null
   >(null);
   const [isAvatarEditorOpen, setIsAvatarEditorOpen] = React.useState(false);
+  // Mirrors `isAvatarEditorOpen` for the `inert` gate on the editor panel,
+  // except on open: `isAvatarEditorOpen` intentionally flips true only on the
+  // next animation frame (`openAvatarEditor` below) so Framer Motion can read
+  // the closed layout before the FLIP transition starts. `inert` gated on
+  // that same flag left a one-frame window, right after clicking "Edit",
+  // where the panel had mounted but was still `inert` — the browser silently
+  // drops focus/typing into anything inside it (a `fill()` that lands in that
+  // window sets the input's value but the change is discarded, no `input`
+  // event fires, so the draft never picks it up). This tracks readiness for
+  // interaction only, set synchronously (no rAF) on open, but in lockstep
+  // with `isAvatarEditorOpen` on both close paths so the closing-fade
+  // behavior is unchanged.
+  const [isAvatarEditorInteractive, setIsAvatarEditorInteractive] =
+    React.useState(false);
   const [isUploadingAvatar, setIsUploadingAvatar] = React.useState(false);
   const [isAvatarEditorFinishing, setIsAvatarEditorFinishing] =
     React.useState(false);
@@ -433,11 +447,13 @@ export function ProfileSettingsCard({
   const closeAvatarEditor = React.useCallback(() => {
     clearAvatarEditorFinishTimeout();
     setIsAvatarEditorOpen(false);
+    setIsAvatarEditorInteractive(false);
     setIsAvatarEditorFinishing(false);
     restoreScrollPosition();
   }, [clearAvatarEditorFinishTimeout, restoreScrollPosition]);
   const completeAvatarEditorClose = React.useCallback(() => {
     setIsAvatarEditorOpen(false);
+    setIsAvatarEditorInteractive(false);
     clearAvatarEditorFinishTimeout();
     restoreScrollPosition();
     avatarEditorFinishTimeoutRef.current = window.setTimeout(
@@ -457,12 +473,16 @@ export function ProfileSettingsCard({
     setShouldRenderAvatarEditor(true);
     setIsAvatarEditorFinishing(false);
     setIsAvatarEditorOpen(true);
+    setIsAvatarEditorInteractive(true);
   }, [clearAvatarEditorFinishTimeout]);
 
   const openAvatarEditor = React.useCallback(() => {
     saveScrollPosition();
     setShouldRenderAvatarEditor(true);
     setIsAvatarEditorFinishing(false);
+    // Interactivity (the `inert` gate) is enabled immediately — only the
+    // animation-timing flag below is deferred a frame.
+    setIsAvatarEditorInteractive(true);
     clearAvatarEditorFinishTimeout();
 
     if (avatarEditorOpenFrameRef.current !== null) {
@@ -901,7 +921,7 @@ export function ProfileSettingsCard({
                         )}
                         aria-busy={isAvatarEditorSaving ? true : undefined}
                         data-testid="profile-avatar-editor-shell"
-                        inert={isAvatarEditorOpen ? undefined : true}
+                        inert={isAvatarEditorInteractive ? undefined : true}
                       >
                         <ProfileAvatarEditor
                           animatedPreviewContainer={animatedPreviewEl}

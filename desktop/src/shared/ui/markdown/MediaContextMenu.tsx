@@ -2,6 +2,7 @@ import * as React from "react";
 import { createPortal } from "react-dom";
 
 import { cn } from "@/shared/lib/cn";
+import { isProgrammaticScrollActive } from "@/shared/lib/programmaticScroll";
 import {
   POPOVER_CUSTOM_ENTER_MOTION_CLASS,
   POPOVER_SHADOW_STYLE,
@@ -28,6 +29,16 @@ export type MediaContextMenuItem = {
  * synchronously lets that trailing event immediately dismiss the menu, so it
  * only flashes. Deferring guarantees the opening interaction can never be the
  * one that closes it.
+ *
+ * `scroll` dismissal skips app-driven scrolls: the timeline keeps a
+ * freshly-arrived message pinned to the bottom for a short window after it
+ * mounts (`useVirtualizedBottomSettle`), re-running `scrollToIndex` for a few
+ * frames while the row's real height settles (e.g. once a video/poster
+ * finishes loading) — which can be a substantial jump, not just sub-pixel
+ * noise. That's the app moving the viewport, not the user scrolling away, so
+ * it should never win a race against a right-click menu opened on the very
+ * row that just arrived. `markProgrammaticScroll` flags that window
+ * (`programmaticScroll.ts`); only scrolls outside it close the menu.
  */
 export function useDismissMediaContextMenu(
   isOpen: boolean,
@@ -36,18 +47,22 @@ export function useDismissMediaContextMenu(
   React.useEffect(() => {
     if (!isOpen) return;
     let attached = false;
+    const handleScroll = () => {
+      if (isProgrammaticScrollActive()) return;
+      onDismiss();
+    };
     const timer = window.setTimeout(() => {
       attached = true;
       window.addEventListener("click", onDismiss);
       window.addEventListener("contextmenu", onDismiss);
-      window.addEventListener("scroll", onDismiss, true);
+      window.addEventListener("scroll", handleScroll, true);
     }, 0);
     return () => {
       window.clearTimeout(timer);
       if (attached) {
         window.removeEventListener("click", onDismiss);
         window.removeEventListener("contextmenu", onDismiss);
-        window.removeEventListener("scroll", onDismiss, true);
+        window.removeEventListener("scroll", handleScroll, true);
       }
     };
   }, [isOpen, onDismiss]);

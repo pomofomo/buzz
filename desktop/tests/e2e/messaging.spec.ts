@@ -654,6 +654,14 @@ test("shows your avatar on your own message when profile avatar is set", async (
   await page.getByTestId("profile-avatar-edit").click();
   await page.getByTestId("profile-avatar-url").fill(avatarUrl);
   await page.getByTestId("profile-avatar-done").click();
+  // Wait for the editor to actually close (and the save to land) before
+  // leaving settings, rather than racing "Back to app" — which lives in the
+  // always-interactive sidebar header, decoupled from the avatar editor's
+  // state — against `handleAvatarEditorDone`'s fire-and-forget `saveProfile()`
+  // (`ProfileSettingsCard`). Not strictly required after the `inert`-gate fix
+  // below, but it's a real readiness signal (not a blind timeout) and a
+  // reasonable belt-and-suspenders wait for a real user's own pacing.
+  await expect(page.getByTestId("profile-avatar-edit")).toBeVisible();
   await page.getByTestId("settings-back-to-app").click();
 
   await page.getByTestId("channel-general").click();
