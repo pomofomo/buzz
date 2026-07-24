@@ -4,6 +4,7 @@ import {
   getRelayWsUrl,
   signRelayEvent,
 } from "@/shared/api/tauri";
+import { getApiKey, getAuthMode } from "@/shared/api/authMode";
 import type { PresenceStatus, RelayEvent } from "@/shared/api/types";
 import {
   KIND_STREAM_MESSAGE,
@@ -554,28 +555,50 @@ export class RelayClient {
       void this.handleWsMessage(message, generation);
     });
 
+    // In `apikey` auth mode the relay authenticates the WebSocket from an
+    // `Authorization: Bearer <token>` header on the upgrade request — there is
+    // no NIP-42 challenge/response. In `nostr` mode the header is omitted and
+    // the challenge handshake runs as before.
+    const authMode = await getAuthMode();
+    let config: Record<string, unknown> = {};
+    if (authMode === "apikey") {
+      const apiKey = await getApiKey();
+      if (apiKey) {
+        config = { authorization: `Bearer ${apiKey}` };
+      }
+    }
+
     this.wsId = await invoke<number>("plugin:websocket|connect", {
       url: this.relayUrl,
       onMessage: this.onMessageChannel,
-      config: {},
+      config,
     });
 
-    await new Promise<void>((resolve, reject) => {
-      const timeout = window.setTimeout(() => {
-        this.authRequest = null;
-        this.resetConnection(
-          new Error("Timed out while waiting for relay authentication."),
-        );
-        reject(new Error("Timed out while waiting for relay authentication."));
-      }, AUTH_TIMEOUT_MS);
+    if (authMode === "apikey") {
+      // Bearer authenticated at the upgrade — the connection is ready as soon
+      // as the socket opens; do not wait for an AUTH challenge that will never
+      // arrive.
+      this.authRequest = null;
+    } else {
+      await new Promise<void>((resolve, reject) => {
+        const timeout = window.setTimeout(() => {
+          this.authRequest = null;
+          this.resetConnection(
+            new Error("Timed out while waiting for relay authentication."),
+          );
+          reject(
+            new Error("Timed out while waiting for relay authentication."),
+          );
+        }, AUTH_TIMEOUT_MS);
 
-      this.authRequest = {
-        pendingEventId: "",
-        resolve,
-        reject,
-        timeout,
-      };
-    });
+        this.authRequest = {
+          pendingEventId: "",
+          resolve,
+          reject,
+          timeout,
+        };
+      });
+    }
 
     // Start a stability timer instead of resetting backoff immediately.
     // The backoff resets to its base value only after BACKOFF_RESET_STABLE_MS

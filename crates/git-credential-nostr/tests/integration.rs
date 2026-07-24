@@ -1,30 +1,26 @@
-//! Integration tests for git-credential-nostr.
+//! Integration tests for git-credential-nostr (bearer credential helper).
 //!
 //! Each test spawns the compiled binary as a subprocess, feeds it the
 //! credential-helper protocol on stdin, and asserts on stdout/stderr/exit-code.
+//! Under the API-key model the helper mints `Authorization: Bearer <BUZZ_API_KEY>`
+//! for Buzz remotes and silently declines everything else.
 
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use base64::Engine as _;
-use nostr::{Keys, ToBech32};
-
-/// Spawn the binary, write `input` to stdin, collect output.
-/// `env_vars` are added on top of the inherited environment.
-/// `NOSTR_PRIVATE_KEY` is always cleared first to prevent test pollution.
-fn run_helper(input: &str, env_vars: &[(&str, &str)]) -> std::process::Output {
+/// Spawn the binary with optional `args`, write `input` to stdin, collect output.
+/// `env_vars` are added on top of the inherited environment. Auth-relevant env
+/// vars are cleared first to prevent host/CI pollution.
+fn run_helper_args(args: &[&str], input: &str, env_vars: &[(&str, &str)]) -> std::process::Output {
     let bin = env!("CARGO_BIN_EXE_git-credential-nostr");
     let mut cmd = Command::new(bin);
-    cmd.stdin(Stdio::piped())
+    cmd.args(args)
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .current_dir(std::env::temp_dir())
+        .env_remove("BUZZ_API_KEY")
         .env_remove("NOSTR_PRIVATE_KEY")
-        .env_remove("BUZZ_AUTH_TAG")
-        .env_remove("GIT_CONFIG_COUNT")
-        // Prevent git config on the test machine from supplying credentials.
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("HOME", std::env::temp_dir());
     for (k, v) in env_vars {
         cmd.env(k, v);
@@ -39,30 +35,28 @@ fn run_helper(input: &str, env_vars: &[(&str, &str)]) -> std::process::Output {
     child.wait_with_output().expect("failed to wait on child")
 }
 
-/// Generate a fresh nsec string for use in tests.
-fn fresh_nsec() -> String {
-    let keys = Keys::generate();
-    keys.secret_key().to_bech32().unwrap()
+fn run_helper(input: &str, env_vars: &[(&str, &str)]) -> std::process::Output {
+    run_helper_args(&["get"], input, env_vars)
 }
 
-/// Standard valid credential-helper input (includes authtype capability).
-fn valid_input() -> String {
+/// Standard credential-helper input for a Buzz remote: advertises the authtype
+/// capability and carries the relay's `Bearer realm="buzz"` challenge.
+fn buzz_input() -> String {
     "capability[]=authtype\n\
      capability[]=state\n\
      protocol=https\n\
      host=relay.example.com\n\
      path=git/owner/repo.git/info/refs\n\
-     wwwauth[]=Nostr realm=\"buzz\", method=\"GET\"\n\
+     wwwauth[]=Bearer realm=\"buzz\"\n\
      \n"
     .to_string()
 }
 
-/// Happy path: valid key + valid input → well-formed credential response with
-/// a base64-encoded kind:27235 JSON event.
+/// Happy path: `BUZZ_API_KEY` set + Buzz bearer challenge → `authtype=Bearer`
+/// and the key echoed as the credential.
 #[test]
-fn happy_path() {
-    let nsec = fresh_nsec();
-    let out = run_helper(&valid_input(), &[("NOSTR_PRIVATE_KEY", &nsec)]);
+fn happy_path_emits_bearer_credential() {
+    let out = run_helper(&buzz_input(), &[("BUZZ_API_KEY", "secret-api-key-123")]);
 
     assert!(
         out.status.success(),
@@ -79,8 +73,12 @@ fn happy_path() {
         "missing capability[]=authtype in:\n{stdout}"
     );
     assert!(
-        lines.contains(&"authtype=Nostr"),
-        "missing authtype=Nostr in:\n{stdout}"
+        lines.contains(&"authtype=Bearer"),
+        "missing authtype=Bearer in:\n{stdout}"
+    );
+    assert!(
+        lines.contains(&"credential=secret-api-key-123"),
+        "missing/incorrect credential in:\n{stdout}"
     );
     assert!(
         lines.contains(&"ephemeral=true"),
@@ -90,267 +88,111 @@ fn happy_path() {
         lines.contains(&"quit=true"),
         "missing quit=true in:\n{stdout}"
     );
-
-    // Extract and validate the credential value.
-    let cred_line = lines
-        .iter()
-        .find(|l| l.starts_with("credential="))
-        .expect("no credential= line in output");
-    let b64 = cred_line.strip_prefix("credential=").unwrap();
-
-    let json_bytes = base64::engine::general_purpose::STANDARD
-        .decode(b64)
-        .expect("credential is not valid base64");
-    let json_str = String::from_utf8(json_bytes).expect("credential is not valid UTF-8");
-
-    let event: serde_json::Value =
-        serde_json::from_str(&json_str).expect("credential does not decode to JSON");
-
-    assert_eq!(
-        event["kind"],
-        serde_json::json!(27235),
-        "expected kind 27235, got {}",
-        event["kind"]
-    );
-
-    // Sanity-check a few more fields the NIP-98 event must have.
-    assert!(event["id"].is_string(), "event missing 'id'");
-    assert!(event["pubkey"].is_string(), "event missing 'pubkey'");
-    assert!(event["sig"].is_string(), "event missing 'sig'");
-    assert!(event["tags"].is_array(), "event missing 'tags'");
 }
 
-/// A Buzz-managed agent must carry its NIP-OA owner attestation inside the
-/// signed NIP-98 event so the relay can admit it through the owner's membership.
-#[test]
-fn includes_nip_oa_auth_tag_in_signed_event() {
-    let agent_keys = Keys::generate();
-    let owner_keys = Keys::generate();
-    let nsec = agent_keys.secret_key().to_bech32().unwrap();
-    let auth_tag = serde_json::to_string(&[
-        "auth",
-        owner_keys.public_key().to_hex().as_str(),
-        "",
-        &"00".repeat(64),
-    ])
-    .expect("serialize auth tag");
-
-    let out = run_helper(
-        &valid_input(),
-        &[("NOSTR_PRIVATE_KEY", &nsec), ("BUZZ_AUTH_TAG", &auth_tag)],
-    );
-    assert!(
-        out.status.success(),
-        "helper failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let credential = stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("credential="))
-        .expect("credential output");
-    let event_json = base64::engine::general_purpose::STANDARD
-        .decode(credential)
-        .expect("base64 credential");
-    let event: nostr::Event = serde_json::from_slice(&event_json).expect("NIP-98 event");
-
-    assert!(
-        event.verify().is_ok(),
-        "auth tag must be covered by the event signature"
-    );
-    assert!(event.tags.iter().any(|tag| tag.as_slice()
-        == [
-            "auth",
-            owner_keys.public_key().to_hex().as_str(),
-            "",
-            serde_json::from_str::<Vec<String>>(&auth_tag).unwrap()[3].as_str(),
-        ]));
-}
-
-/// A configured but malformed owner attestation must fail closed rather than
-/// silently authenticating the agent without delegation.
-#[test]
-fn malformed_nip_oa_auth_tag_fails_closed() {
-    let nsec = fresh_nsec();
-    let out = run_helper(
-        &valid_input(),
-        &[("NOSTR_PRIVATE_KEY", &nsec), ("BUZZ_AUTH_TAG", "not-json")],
-    );
-
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("invalid NIP-OA auth tag"));
-    assert!(!String::from_utf8_lossy(&out.stdout).contains("credential="));
-}
-
-/// Old git (no `capability[]=authtype` in input) → empty line on stdout, exit 0.
+/// Old git (no `capability[]=authtype`) → single blank line, exit 0, no credential.
 #[test]
 fn old_git_no_authtype_capability() {
     let input = "protocol=https\n\
                  host=relay.example.com\n\
                  path=git/owner/repo.git/info/refs\n\
+                 wwwauth[]=Bearer realm=\"buzz\"\n\
                  \n";
 
-    let nsec = fresh_nsec();
-    let out = run_helper(input, &[("NOSTR_PRIVATE_KEY", &nsec)]);
+    let out = run_helper(input, &[("BUZZ_API_KEY", "secret-api-key-123")]);
 
     assert!(
         out.status.success(),
         "expected exit 0 for old-git path, got {:?}",
         out.status.code()
     );
-
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // Output should be just a blank line — no credential data.
-    assert_eq!(
-        stdout.trim(),
-        "",
-        "expected empty output for old-git path, got:\n{stdout}"
-    );
+    assert_eq!(stdout.trim(), "", "expected empty output, got:\n{stdout}");
     assert!(
         !stdout.contains("credential="),
         "should not emit credential= for old git"
     );
 }
 
-/// No key configured at all → exit 1, stderr mentions "no nostr key configured".
+/// A non-Buzz bearer challenge (wrong realm) must NOT leak the key — silent
+/// decline (exit 0, no credential) so git falls through to other helpers.
 #[test]
-fn missing_key() {
-    // run_helper already clears NOSTR_PRIVATE_KEY and points HOME at a temp dir
-    // that has no git config, so no keyfile will be found.
-    let out = run_helper(&valid_input(), &[]);
-
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "expected exit 1 for missing key"
-    );
-
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("no nostr key configured"),
-        "expected 'no nostr key configured' in stderr, got:\n{stderr}"
-    );
-}
-
-/// `wwwauth[]` present but missing `method="..."` → exit 0, no credential emitted.
-/// The helper gracefully declines rather than erroring, so git can fall through
-/// to the next credential helper (safe for global credential.helper config).
-#[test]
-fn missing_method_hint() {
+fn non_buzz_challenge_declines_without_leaking_key() {
     let input = "capability[]=authtype\n\
-                 capability[]=state\n\
                  protocol=https\n\
-                 host=relay.example.com\n\
-                 path=git/owner/repo.git/info/refs\n\
-                 wwwauth[]=Nostr realm=\"buzz\"\n\
+                 host=github.com\n\
+                 path=owner/repo.git/info/refs\n\
+                 wwwauth[]=Bearer realm=\"github\"\n\
                  \n";
 
-    let nsec = fresh_nsec();
-    let out = run_helper(input, &[("NOSTR_PRIVATE_KEY", &nsec)]);
+    let out = run_helper(input, &[("BUZZ_API_KEY", "secret-api-key-123")]);
 
-    assert!(
-        out.status.success(),
-        "expected exit 0 for missing method hint (graceful decline), got {:?}",
-        out.status.code()
-    );
-
+    assert!(out.status.success(), "expected exit 0 for non-Buzz remote");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         !stdout.contains("credential="),
-        "should not emit credential= when method hint is missing"
+        "must not present the Buzz key to a non-Buzz remote:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("secret-api-key-123"),
+        "the bearer key must never appear for a non-Buzz remote"
     );
 }
 
-/// Input without `path=` line (useHttpPath not set) → exit 1, stderr mentions "useHttpPath".
-/// The relay requires the full repo-root URL for NIP-98 verification, so the
-/// credential helper cannot function without the path component.
+/// No `wwwauth[]` challenge at all → silent decline (exit 0, no credential).
 #[test]
-fn missing_path() {
+fn absent_challenge_declines() {
     let input = "capability[]=authtype\n\
-                 capability[]=state\n\
                  protocol=https\n\
                  host=relay.example.com\n\
-                 wwwauth[]=Nostr realm=\"buzz\", method=\"GET\"\n\
+                 path=git/owner/repo.git/info/refs\n\
                  \n";
 
-    let nsec = fresh_nsec();
-    let out = run_helper(input, &[("NOSTR_PRIVATE_KEY", &nsec)]);
+    let out = run_helper(input, &[("BUZZ_API_KEY", "secret-api-key-123")]);
 
-    assert_eq!(
-        out.status.code(),
-        Some(1),
-        "expected exit 1 for missing path"
-    );
-
-    let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("useHttpPath"),
-        "expected 'useHttpPath' in stderr, got:\n{stderr}"
+        out.status.success(),
+        "expected exit 0 when no challenge present"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("credential="),
+        "should not emit a credential without a Buzz bearer challenge"
     );
 }
 
-/// Keyfile with 0644 permissions → exit 1, stderr mentions "insecure permissions".
-#[cfg(unix)]
+/// Buzz challenge but `BUZZ_API_KEY` unset → exit 1, stderr names the env var.
 #[test]
-fn bad_keyfile_permissions() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let nsec = fresh_nsec();
-
-    // Write keyfile to a temp path.
-    let tmp_dir = std::env::temp_dir();
-    let keyfile = tmp_dir.join(format!(
-        "nostr-test-key-{}.nsec",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos()
-    ));
-    std::fs::write(&keyfile, &nsec).expect("failed to write temp keyfile");
-
-    // Set insecure permissions (0644).
-    std::fs::set_permissions(&keyfile, std::fs::Permissions::from_mode(0o644))
-        .expect("failed to set permissions");
-
-    // Point a scratch git config at the keyfile.
-    let git_config_dir = tmp_dir.join(format!(
-        "nostr-test-gitconfig-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos()
-    ));
-    std::fs::create_dir_all(&git_config_dir).unwrap();
-    let git_config_file = git_config_dir.join(".gitconfig");
-    std::fs::write(
-        &git_config_file,
-        format!("[nostr]\n\tkeyfile = {}\n", keyfile.display()),
-    )
-    .expect("failed to write git config");
-
-    let out = run_helper(
-        &valid_input(),
-        &[
-            ("HOME", git_config_dir.to_str().unwrap()),
-            ("GIT_CONFIG_GLOBAL", git_config_file.to_str().unwrap()),
-        ],
-    );
-
-    // Clean up regardless of outcome.
-    let _ = std::fs::remove_file(&keyfile);
-    let _ = std::fs::remove_file(&git_config_file);
-    let _ = std::fs::remove_dir(&git_config_dir);
+fn missing_api_key_errors() {
+    // run_helper clears BUZZ_API_KEY.
+    let out = run_helper(&buzz_input(), &[]);
 
     assert_eq!(
         out.status.code(),
         Some(1),
-        "expected exit 1 for insecure keyfile permissions"
+        "expected exit 1 when BUZZ_API_KEY is unset"
     );
-
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("insecure permissions"),
-        "expected 'insecure permissions' in stderr, got:\n{stderr}"
+        stderr.contains("BUZZ_API_KEY"),
+        "expected BUZZ_API_KEY in stderr, got:\n{stderr}"
     );
+}
+
+/// `store` and `erase` operations are no-ops (exit 0, no output) — the helper
+/// only services `get`.
+#[test]
+fn store_and_erase_are_noops() {
+    for op in ["store", "erase"] {
+        let out = run_helper_args(
+            &[op],
+            &buzz_input(),
+            &[("BUZZ_API_KEY", "secret-api-key-123")],
+        );
+        assert!(out.status.success(), "expected exit 0 for `{op}`");
+        assert!(
+            out.stdout.is_empty(),
+            "`{op}` must produce no output, got:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
 }

@@ -28,6 +28,12 @@ pub enum AuditAction {
     RateLimitExceeded,
     /// A media file was uploaded via the Blossom endpoint.
     MediaUploaded,
+    /// A cutover genesis marker appended when a community migrates off the
+    /// Nostr substrate onto API-key auth. Its `detail` references the last
+    /// Nostr-era chain head hash + timestamp so pre-cutover history stays
+    /// anchored to the continuing chain. Appended once, by an operator, at
+    /// cutover — see [`crate::service::AuditService::append_cutover_genesis`].
+    CutoverGenesis,
 }
 
 impl AuditAction {
@@ -45,6 +51,7 @@ impl AuditAction {
             Self::AuthFailure => "auth_failure",
             Self::RateLimitExceeded => "rate_limit_exceeded",
             Self::MediaUploaded => "media_uploaded",
+            Self::CutoverGenesis => "cutover_genesis",
         }
     }
 
@@ -60,6 +67,7 @@ impl AuditAction {
         Self::AuthFailure,
         Self::RateLimitExceeded,
         Self::MediaUploaded,
+        Self::CutoverGenesis,
     ];
 }
 

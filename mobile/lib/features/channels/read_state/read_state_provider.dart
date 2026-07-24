@@ -62,28 +62,20 @@ class ReadStateNotifier extends Notifier<ReadStateState> {
 
     final relayConfig = ref.watch(relayConfigProvider);
     ref.watch(relaySessionProvider);
-    final activeCommunity = ref.watch(activeCommunityProvider).value;
+    // Rebuild when the active community changes (actor may differ).
+    ref.watch(activeCommunityProvider);
 
-    final nsec = relayConfig.nsec?.trim();
-    if (nsec == null || nsec.isEmpty) {
+    final pubkey = _normalizePubkey(relayConfig.actorPubkey);
+    if (pubkey == null) {
       return const ReadStateState.inert();
     }
 
     final signedRelay = SignedEventRelay(
       session: ref.read(relaySessionProvider.notifier),
-      nsec: nsec,
+      actorPubkey: pubkey,
     );
-    final pubkey =
-        _normalizePubkey(activeCommunity?.pubkey) ??
-        _safeDerivedPubkey(signedRelay);
-    if (pubkey == null) {
-      return const ReadStateState.inert();
-    }
 
-    final crypto = ReadStateCrypto.tryCreate(nsec: nsec, pubkey: pubkey);
-    if (crypto == null) {
-      return const ReadStateState.inert();
-    }
+    const crypto = ReadStateCrypto();
 
     final prefs = ref.read(savedPrefsProvider);
     late final ReadStateManager manager;
@@ -188,13 +180,4 @@ String? _normalizePubkey(String? value) {
     return null;
   }
   return normalized;
-}
-
-String? _safeDerivedPubkey(SignedEventRelay relay) {
-  try {
-    return _normalizePubkey(relay.pubkey);
-  } catch (e) {
-    debugPrint('[ReadStateManager] pubkey derivation failed: $e');
-    return null;
-  }
 }

@@ -1,6 +1,7 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 
 import { createAuthEvent } from "@/shared/api/tauri";
+import { getApiKey, getAuthMode } from "@/shared/api/authMode";
 import type { RelayEvent } from "@/shared/api/types";
 import {
   getTextPayload,
@@ -136,11 +137,27 @@ export class ReadOnlyRelayClient {
       void this.handleWsMessage(message, generation);
     });
 
+    // Bearer at the upgrade in `apikey` mode; NIP-42 challenge in `nostr` mode.
+    const authMode = await getAuthMode();
+    let config: Record<string, unknown> = {};
+    if (authMode === "apikey") {
+      const apiKey = await getApiKey();
+      if (apiKey) {
+        config = { authorization: `Bearer ${apiKey}` };
+      }
+    }
+
     this.wsId = await invoke<number>("plugin:websocket|connect", {
       url: this.relayUrl,
       onMessage: this.onMessageChannel,
-      config: {},
+      config,
     });
+
+    if (authMode === "apikey") {
+      // Authenticated at the upgrade — ready immediately, no AUTH challenge.
+      this.authRequest = null;
+      return;
+    }
 
     await new Promise<void>((resolve, reject) => {
       const timeout = window.setTimeout(() => {

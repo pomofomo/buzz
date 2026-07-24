@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { queryEvents, type NostrEvent } from "@/shared/lib/nostr-client";
+import { queryRelayEvents, type NostrEvent } from "@/shared/lib/nostr-client";
 import { relayWsUrl } from "@/shared/lib/relay-url";
 import { mockRepos } from "./mock-repos";
 
@@ -63,7 +63,7 @@ export function dedup(events: NostrEvent[]): NostrEvent[] {
 }
 
 async function fetchRepos(): Promise<Repo[]> {
-  const events = await queryEvents(relayWsUrl(), { kinds: [30617] });
+  const events = await queryRelayEvents(relayWsUrl(), { kinds: [30617] });
   return dedup(events)
     .map(eventToRepo)
     .sort((a, b) => b.createdAt - a.createdAt);

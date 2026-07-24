@@ -113,13 +113,21 @@ impl ConnectionState {
 
 /// Entry point for a new WebSocket connection.
 ///
-/// Acquires a connection semaphore permit, sends the NIP-42 AUTH challenge,
-/// then drives the send, heartbeat, and receive loops until the connection closes.
+/// Acquires a connection semaphore permit, then either:
+/// - **nostr mode:** sends the NIP-42 AUTH challenge and waits for a signed
+///   AUTH frame; or
+/// - **apikey mode:** resolves the `Authorization: Bearer <token>` presented on
+///   the WebSocket upgrade request (`bearer_token`) via
+///   [`buzz_auth::AuthService::verify_api_key`] and marks the connection
+///   authenticated at connect — no challenge round-trip.
+///
+/// Then drives the send, heartbeat, and receive loops until the connection closes.
 pub async fn handle_connection(
     socket: WebSocket,
     state: Arc<AppState>,
     addr: SocketAddr,
     tenant: TenantContext,
+    bearer_token: Option<String>,
 ) {
     let conn_id = Uuid::new_v4();
     let cancel = CancellationToken::new();
@@ -133,11 +141,65 @@ pub async fn handle_connection(
         community_id,
         cancel.clone(),
         move || async move { check_state.db.is_community_active(community_id).await },
-        move || handle_active_connection(socket, run_state, addr, tenant, conn_id, cancel),
+        move || {
+            handle_active_connection(
+                socket,
+                run_state,
+                addr,
+                tenant,
+                conn_id,
+                cancel,
+                bearer_token,
+            )
+        },
     )
     .await;
 }
 
+/// Resolve an `apikey`-mode WebSocket bearer token at connect.
+///
+/// Mirrors the post-auth gates the NIP-42 handler applies: the token is resolved
+/// to an [`AuthContext`], then the community **ban** gate and the **relay
+/// membership** gate run (both fail closed). NIP-OA owner delegation does not
+/// apply to bearer auth, so no `auth` tag is passed. Returns a short, non-leaky
+/// reason string on failure.
+async fn authenticate_ws_bearer(
+    state: &AppState,
+    tenant: &TenantContext,
+    token: Option<&str>,
+) -> Result<AuthContext, &'static str> {
+    let token = token.ok_or("missing bearer token")?;
+    let ctx = state
+        .auth
+        .verify_api_key(token, tenant.community(), &state.db)
+        .await
+        .map_err(|_| "invalid bearer token")?;
+
+    // Community ban gate — fail closed on a DB error (never admit a banned actor).
+    match state
+        .db
+        .moderation_restriction_state(tenant.community(), ctx.pubkey.as_bytes())
+        .await
+    {
+        Ok(restriction) if restriction.banned => return Err("banned"),
+        Ok(_) => {}
+        Err(_) => return Err("ban check error"),
+    }
+
+    // Relay membership gate (no NIP-OA delegation for bearer auth).
+    crate::api::relay_members::enforce_relay_membership(
+        state,
+        tenant.community(),
+        ctx.pubkey.as_bytes(),
+        None,
+    )
+    .await
+    .map_err(|_| "not a relay member")?;
+
+    Ok(ctx)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_active_connection(
     socket: WebSocket,
     state: Arc<AppState>,
@@ -145,6 +207,7 @@ async fn handle_active_connection(
     tenant: TenantContext,
     conn_id: Uuid,
     cancel: CancellationToken,
+    bearer_token: Option<String>,
 ) {
     let permit = match state.conn_semaphore.clone().try_acquire_owned() {
         Ok(p) => p,
@@ -152,6 +215,29 @@ async fn handle_active_connection(
             warn!("Connection limit reached, rejecting {addr}");
             return;
         }
+    };
+
+    // Auth-doorway selection. In apikey mode we resolve the bearer token now and
+    // start the connection already-authenticated; in nostr mode we fall through
+    // to the NIP-42 challenge flow unchanged.
+    let apikey_mode = state.auth.auth_mode().is_apikey();
+    let bearer_ctx = if apikey_mode {
+        match authenticate_ws_bearer(&state, &tenant, bearer_token.as_deref()).await {
+            Ok(ctx) => Some(ctx),
+            Err(reason) => {
+                warn!(
+                    conn_id = %conn_id,
+                    addr = %addr,
+                    reason,
+                    "apikey WebSocket auth failed at connect — closing"
+                );
+                metrics::counter!("buzz_auth_failures_total", "reason" => "apikey_connect_denied")
+                    .increment(1);
+                return;
+            }
+        }
+    } else {
+        None
     };
 
     let challenge = generate_challenge();
@@ -164,13 +250,20 @@ async fn handle_active_connection(
     let backpressure_count = Arc::new(AtomicU8::new(0));
     let subscriptions = Arc::new(Mutex::new(HashMap::new()));
 
+    // In apikey mode the connection is authenticated at connect; in nostr mode it
+    // starts Pending awaiting the signed AUTH frame.
+    let initial_auth_state = match &bearer_ctx {
+        Some(ctx) => AuthState::Authenticated(ctx.clone()),
+        None => AuthState::Pending {
+            challenge: challenge.clone(),
+        },
+    };
+
     let conn = Arc::new(ConnectionState {
         conn_id,
         tenant,
         remote_addr: addr,
-        auth_state: RwLock::new(AuthState::Pending {
-            challenge: challenge.clone(),
-        }),
+        auth_state: RwLock::new(initial_auth_state),
         subscriptions: Arc::clone(&subscriptions),
         send_tx: tx.clone(),
         ctrl_tx: ctrl_tx.clone(),
@@ -186,14 +279,18 @@ async fn handle_active_connection(
     )
     .increment(1);
 
-    let challenge_msg = RelayMessage::auth_challenge(&challenge);
-    if tx
-        .send(WsMessage::Text(challenge_msg.into()))
-        .await
-        .is_err()
-    {
-        warn!(conn_id = %conn_id, "Failed to send AUTH challenge — client disconnected immediately");
-        return;
+    // nostr mode: send the NIP-42 challenge. apikey mode: the connection is
+    // already authenticated at connect, so no challenge is emitted.
+    if bearer_ctx.is_none() {
+        let challenge_msg = RelayMessage::auth_challenge(&challenge);
+        if tx
+            .send(WsMessage::Text(challenge_msg.into()))
+            .await
+            .is_err()
+        {
+            warn!(conn_id = %conn_id, "Failed to send AUTH challenge — client disconnected immediately");
+            return;
+        }
     }
 
     // Gauge incremented AFTER challenge send succeeds — early disconnects
@@ -211,6 +308,16 @@ async fn handle_active_connection(
         subscriptions,
         state.config.slow_client_grace_limit,
     );
+
+    // apikey mode: record the authenticated principal so principal-scoped
+    // accounting and presence match the NIP-42 path (which sets this in the
+    // AUTH handler on success).
+    if let Some(ctx) = &bearer_ctx {
+        state
+            .conn_manager
+            .set_authenticated_pubkey(conn_id, ctx.pubkey.to_bytes().to_vec());
+        info!(conn_id = %conn_id, pubkey = %ctx.pubkey.to_hex(), "apikey WebSocket auth successful");
+    }
 
     let (ws_send, ws_recv) = socket.split();
 

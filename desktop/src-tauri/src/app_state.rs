@@ -17,6 +17,13 @@ use crate::managed_agents::config_bridge::SessionConfigCache;
 use crate::managed_agents::{ManagedAgentPairRuntime, ManagedAgentRuntimeKey};
 pub struct AppState {
     pub keys: Mutex<Keys>,
+    /// Cached API bearer token for `apikey` auth mode. `None` = not loaded /
+    /// not configured. Populated from the `BUZZ_API_KEY` env override, the OS
+    /// keyring (lazy), or a `set_api_key` command. In `apikey` mode the client
+    /// attaches this as an `Authorization: Bearer <token>` header on the WS
+    /// upgrade and HTTP bridge calls; the server authors rows from the
+    /// resolved actor (no client-side signing).
+    pub api_key: Mutex<Option<String>>,
     pub http_client: reqwest::Client,
     /// A no-redirect client for authenticated relay media fetches (download,
     /// clipboard copy, snapshot, editor). Every caller pre-validates the URL
@@ -152,6 +159,24 @@ fn identity_from_env() -> Option<Keys> {
     }
 }
 
+/// Read the `BUZZ_API_KEY` env var as the API bearer token. `Some` means the
+/// env var was present and non-empty and MUST win over any persisted keyring
+/// token (the dev/CI/agent-harness override, mirroring `BUZZ_PRIVATE_KEY`).
+/// `None` means absent or empty — callers fall through to keyring resolution.
+fn api_key_from_env() -> Option<String> {
+    match std::env::var("BUZZ_API_KEY") {
+        Ok(key) => {
+            let trimmed = key.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
+        Err(_) => None,
+    }
+}
+
 /// Build the no-redirect HTTP client used for authenticated relay media
 /// fetches (download / copy).
 ///
@@ -189,6 +214,10 @@ pub fn build_app_state() -> AppState {
 
     AppState {
         keys: Mutex::new(keys),
+        // Env override wins for agents/CI/dev (mirrors BUZZ_PRIVATE_KEY). When
+        // absent, `AppState::api_key` lazily loads the persisted token from the
+        // OS keyring on first use.
+        api_key: Mutex::new(api_key_from_env()),
         http_client: reqwest::Client::builder()
             .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
             .pool_idle_timeout(std::time::Duration::from_secs(10))
@@ -313,6 +342,38 @@ impl AppState {
             .map(|k| k.clone())
     }
 
+    /// Return the API bearer token for `apikey` auth mode, if one is
+    /// configured. Resolution order: `BUZZ_API_KEY` env override → in-memory
+    /// cache → OS keyring (lazily, caching the result). Returns `None` when no
+    /// token is available, in which case the client falls back to the Nostr
+    /// auth doorway.
+    pub fn api_key(&self) -> Option<String> {
+        if let Some(env_key) = api_key_from_env() {
+            return Some(env_key);
+        }
+        if let Ok(guard) = self.api_key.lock() {
+            if let Some(key) = guard.as_ref() {
+                return Some(key.clone());
+            }
+        }
+        // Lazy keyring load — cache the result so repeated reads don't re-hit
+        // the OS backend (SecretStore also caches internally).
+        let loaded = load_persisted_api_key();
+        if let Some(ref key) = loaded {
+            if let Ok(mut guard) = self.api_key.lock() {
+                *guard = Some(key.clone());
+            }
+        }
+        loaded
+    }
+
+    /// Replace the cached API bearer token. Pass `None` to clear it.
+    pub fn set_cached_api_key(&self, key: Option<String>) {
+        if let Ok(mut guard) = self.api_key.lock() {
+            *guard = key;
+        }
+    }
+
     /// Emit the current huddle state to the frontend via Tauri event.
     ///
     /// Acquires both locks (app_handle + huddle_state), clones a snapshot,
@@ -382,6 +443,36 @@ pub(crate) use keyring_config::keyring_service;
 
 /// Keyring key name for the human identity nsec.
 const IDENTITY_KEY_NAME: &str = "identity";
+
+/// Keyring key name for the API bearer token (`apikey` auth mode). Stored in
+/// the same OS keyring blob as the nsec, alongside it during migration.
+const API_KEY_NAME: &str = "api_key";
+
+/// Load the persisted API bearer token from the OS keyring, if present.
+/// Returns `None` when the keyring feature is disabled, no token is stored, or
+/// the backend is unavailable (the client then falls back to the Nostr
+/// doorway, and the token can be re-provisioned via `set_api_key`).
+pub(crate) fn load_persisted_api_key() -> Option<String> {
+    if !cfg!(feature = "system-keyring") {
+        return None;
+    }
+    let store = crate::secret_store::SecretStore::shared(keyring_service());
+    store.load(API_KEY_NAME).ok().flatten()
+}
+
+/// Persist the API bearer token into the OS keyring. Returns `Err` when the
+/// keyring feature is disabled or the backend write fails.
+pub(crate) fn persist_api_key(key: &str) -> Result<(), String> {
+    let store = crate::secret_store::SecretStore::shared(keyring_service());
+    store.store(API_KEY_NAME, key)
+}
+
+/// Delete the persisted API bearer token from the OS keyring. A missing entry
+/// is not an error.
+pub(crate) fn delete_persisted_api_key() -> Result<(), String> {
+    let store = crate::secret_store::SecretStore::shared(keyring_service());
+    store.delete(API_KEY_NAME)
+}
 
 /// Filename of the marker written once a successful keyring migration deletes
 /// the legacy `identity.key`. Its presence is the only durable signal that a

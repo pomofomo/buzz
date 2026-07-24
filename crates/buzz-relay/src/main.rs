@@ -433,6 +433,20 @@ async fn main() -> anyhow::Result<()> {
     );
     let state = Arc::new(app_state);
 
+    // TODO(Lane F — audit WORM anchoring): spawn the external head-hash anchor
+    // worker here once the auth-refactor lanes settle. It is intentionally NOT
+    // wired yet to avoid startup/state merge conflicts with in-flight lanes.
+    // The worker is off unless BUZZ_AUDIT_ANCHOR_ENABLED=true, so leaving it
+    // unspawned is a no-op. To enable, add (needs a `PgPool` — e.g. the pool
+    // backing `db`/`audit` — and the graceful-shutdown cancellation token):
+    //
+    //     let anchor_cfg = buzz_audit::AnchorConfig::from_env();
+    //     let anchor_handle = buzz_audit::spawn_anchor_worker(
+    //         pool.clone(), anchor_cfg, shutdown_token.cancelled_owned());
+    //
+    // then await `anchor_handle` alongside `audit_shutdown.drain(...)` during
+    // graceful shutdown so the final anchor flushes before exit.
+
     // Inter-relay mesh (BUZZ_MESH seam). `boot_mesh` returns None when the
     // kill switch is off — nothing is bound, published, or spawned, so the
     // relay behaves byte-identically to a build without the mesh. When
@@ -1235,7 +1249,9 @@ fn reminder_to_event(reminder: &buzz_db::event::DueReminder) -> nostr::Event {
         "kind": reminder.kind as u16,
         "tags": reminder.tags,
         "content": reminder.content,
-        "sig": hex::encode(&reminder.sig),
+        // `sig` is nullable (server-authored rows). An empty sig rehydrates to
+        // an all-zero placeholder so the wire type still constructs; never verified.
+        "sig": buzz_db::event::rehydrate_sig_hex(Some(reminder.sig.as_slice())),
     });
 
     serde_json::from_value(event_json).expect("valid event JSON from DB row")

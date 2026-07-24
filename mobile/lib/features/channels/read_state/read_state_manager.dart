@@ -3,40 +3,22 @@ import 'dart:convert';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
-import 'package:nostr/nostr.dart' as nostr;
 import 'package:shared_preferences/shared_preferences.dart';
 
-import '../../../shared/crypto/nip44.dart';
 import '../../../shared/relay/relay.dart';
 import 'read_state_format.dart';
 import 'read_state_storage.dart';
 import 'read_state_time.dart';
 
+/// Plaintext pass-through. Client-side E2E encryption of read-state blobs was
+/// dropped in the API-key migration — the server holds these rows in plaintext,
+/// gated by scope + membership.
 class ReadStateCrypto {
-  final Uint8List conversationKey;
+  const ReadStateCrypto();
 
-  const ReadStateCrypto._(this.conversationKey);
+  String encrypt(String plaintext) => plaintext;
 
-  static ReadStateCrypto? tryCreate({
-    required String nsec,
-    required String pubkey,
-  }) {
-    try {
-      final privkeyHex = nostr.Nip19.decode(payload: nsec).data;
-      if (privkeyHex.isEmpty || pubkey.isEmpty) {
-        return null;
-      }
-      return ReadStateCrypto._(getConversationKey(privkeyHex, pubkey));
-    } catch (e) {
-      debugPrint('[ReadStateManager] crypto init failed: $e');
-      return null;
-    }
-  }
-
-  String encrypt(String plaintext) => nip44Encrypt(conversationKey, plaintext);
-
-  String decrypt(String ciphertext) =>
-      nip44Decrypt(conversationKey, ciphertext);
+  String decrypt(String ciphertext) => ciphertext;
 }
 
 enum _ApplyRemoteContextResult { unchanged, advanced }

@@ -127,6 +127,96 @@ pub(crate) fn verify_bridge_auth_with_options(
     Err(api_error(StatusCode::UNAUTHORIZED, "missing Nostr auth"))
 }
 
+/// The resolved HTTP-bridge principal: `(actor, replay_event_id, scopes,
+/// channel_ids)`.
+///
+/// - `actor` — the authenticated principal (the actor id in `apikey` mode, the
+///   NIP-98/`X-Pubkey` signer in `nostr` mode), carried in the retained
+///   `pubkey`-shaped [`nostr::PublicKey`] (decision #2).
+/// - `replay_event_id` — the NIP-98 event id used by the replay guard; zeroed in
+///   `apikey` mode (a bearer token carries no per-request nonce, so the guard
+///   no-ops on a zero id).
+/// - `scopes` — the token's stored scopes in `apikey` mode, or
+///   [`buzz_auth::Scope::all_known`] in `nostr` mode.
+/// - `channel_ids` — the token's optional per-key channel restriction in `apikey`
+///   mode (`None` = unrestricted); always `None` in `nostr` mode.
+///
+/// This tuple is the shared authentication seam for every HTTP read/write door
+/// (`/events`, `/query`, `/count`) and — from Lane E onward — Blossom media; keep
+/// the shape stable so those callers can destructure it uniformly.
+pub(crate) type BridgePrincipal = (
+    nostr::PublicKey,
+    [u8; 32],
+    Vec<buzz_auth::Scope>,
+    Option<Vec<uuid::Uuid>>,
+);
+
+/// Resolve the HTTP bridge principal according to the active [`buzz_auth::AuthMode`].
+///
+/// - **nostr mode:** delegates to [`verify_bridge_auth`] (NIP-98, or the dev
+///   `X-Pubkey` fallback) and grants [`buzz_auth::Scope::all_known`] with no
+///   per-key channel restriction — behaviour unchanged from before this refactor.
+/// - **apikey mode:** validates `Authorization: Bearer <token>` via
+///   [`buzz_auth::AuthService::verify_api_key`] and returns the token's actor id,
+///   its **stored scopes**, and its optional per-key `channel_ids`. The event id
+///   is zeroed — a bearer token carries no per-request nonce, so the NIP-98
+///   replay guard is skipped (it no-ops on a zero id).
+///
+/// Returned scopes flow into the write-path scope check (`required_scope_for_kind`)
+/// and the read-path action gate, so an over-broad request is denied by scope.
+/// The returned `channel_ids` narrow the read paths' accessible-channel set
+/// (`/query`, `/count`) and the server-authored write path's channel access, on
+/// top of — never in place of — the membership gate (decision #6).
+///
+/// See [`BridgePrincipal`] for the return-tuple contract shared with Lane E media.
+pub(crate) async fn resolve_bridge_principal(
+    state: &AppState,
+    tenant: &TenantContext,
+    headers: &HeaderMap,
+    method: &str,
+    url: &str,
+    body: Option<&[u8]>,
+) -> Result<BridgePrincipal, (StatusCode, Json<Value>)> {
+    if state.auth.auth_mode().is_apikey() {
+        let token = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.strip_prefix("Bearer "))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                api_error(
+                    StatusCode::UNAUTHORIZED,
+                    "missing Authorization: Bearer token",
+                )
+            })?;
+        let ctx = state
+            .auth
+            .verify_api_key(token, tenant.community(), &state.db)
+            .await
+            .map_err(|_| api_error(StatusCode::UNAUTHORIZED, "invalid bearer token"))?;
+        Ok((ctx.pubkey, [0u8; 32], ctx.scopes, ctx.channel_ids))
+    } else {
+        let (pubkey, event_id_bytes) =
+            verify_bridge_auth(headers, method, url, body, state.config.require_auth_token)?;
+        Ok((pubkey, event_id_bytes, buzz_auth::Scope::all_known(), None))
+    }
+}
+
+/// Action-level read scope gate for the HTTP bridge, mirroring the WS REQ gate
+/// (`handlers::req`). A no-op under [`buzz_auth::Scope::all_known`] (nostr mode);
+/// in apikey mode a token lacking `messages:read` is denied. The empty-scope
+/// bypass matches the WS path so a principal with no scopes is not blocked here.
+fn enforce_read_scope(scopes: &[buzz_auth::Scope]) -> Result<(), (StatusCode, Json<Value>)> {
+    if !scopes.is_empty() && !scopes.contains(&buzz_auth::Scope::MessagesRead) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "restricted: token lacks messages:read scope",
+        ));
+    }
+    Ok(())
+}
+
 /// Check NIP-98 replay and record the event ID atomically.
 ///
 /// The correctness boundary is the shared, community-scoped Redis seen-set on
@@ -633,21 +723,25 @@ pub async fn submit_event(
         })?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/events");
-    let (pubkey, event_id_bytes) = verify_bridge_auth(
-        &headers,
-        "POST",
-        &url,
-        Some(&body),
-        state.config.require_auth_token,
-    )?;
+    let (pubkey, event_id_bytes, scopes, channel_ids) =
+        resolve_bridge_principal(&state, &tenant, &headers, "POST", &url, Some(&body)).await?;
     let pubkey_hex = pubkey.to_hex();
 
     // Everything after auth — admission, replay, membership, parse, ingest —
     // runs inside the helper.  The thin wrapper here owns the single terminal
     // attribution line so it fires for every outcome, including admission/
     // replay/membership failures that previously returned before any log fired.
-    let outcome =
-        submit_event_authed(&state, &tenant, &headers, &body, pubkey, event_id_bytes).await;
+    let outcome = submit_event_authed(
+        &state,
+        &tenant,
+        &headers,
+        &body,
+        pubkey,
+        event_id_bytes,
+        scopes,
+        channel_ids,
+    )
+    .await;
 
     match &outcome {
         SubmitOutcome::Ok { accepted, .. } => {
@@ -747,6 +841,7 @@ impl SubmitOutcome {
 /// parse, and ingest.  Returns a [`SubmitOutcome`] that carries both the log
 /// fields and the HTTP response so the thin wrapper can emit exactly one
 /// terminal attribution line covering every outcome.
+#[allow(clippy::too_many_arguments)]
 async fn submit_event_authed(
     state: &Arc<AppState>,
     tenant: &TenantContext,
@@ -754,6 +849,8 @@ async fn submit_event_authed(
     body: &[u8],
     pubkey: nostr::PublicKey,
     event_id_bytes: [u8; 32],
+    scopes: Vec<buzz_auth::Scope>,
+    channel_ids: Option<Vec<uuid::Uuid>>,
 ) -> SubmitOutcome {
     // Admission and replay checks fire before body parse — a 429 or replay
     // reject on a malformed body must still be attributed.
@@ -824,10 +921,29 @@ async fn submit_event_authed(
     }
 
     let kind_u32 = buzz_core::kind::event_kind_u32(&event);
-    let auth = IngestAuth::Http {
-        pubkey,
-        scopes: buzz_auth::Scope::all_known(), // Pure Nostr: full scopes, channel access via membership
-        auth_method: crate::handlers::ingest::HttpAuthMethod::Nip98,
+    // Scopes come from the resolved principal: `all_known` in nostr mode
+    // (unchanged), or the bearer token's stored scopes in apikey mode. The
+    // downstream `required_scope_for_kind` check enforces them per kind.
+    //
+    // In apikey mode the bearer principal server-authors the row: the client
+    // POSTs an UNSIGNED intent envelope and `ingest_event` stamps the actor/id/
+    // sig (via `IngestAuth::ApiKey`). In nostr mode the NIP-98 signed path is
+    // unchanged. The token's per-key `channel_ids` narrowing is threaded through
+    // here (matching the WS EVENT path); channel access is still ultimately
+    // enforced by the `check_channel_membership` gate downstream, with the
+    // token's `channel_ids` as additional narrowing.
+    let auth = if state.auth.auth_mode().is_apikey() {
+        IngestAuth::ApiKey {
+            actor: pubkey,
+            scopes,
+            channel_ids,
+        }
+    } else {
+        IngestAuth::Http {
+            pubkey,
+            scopes,
+            auth_method: crate::handlers::ingest::HttpAuthMethod::Nip98,
+        }
     };
 
     match crate::handlers::ingest::ingest_event(state, tenant, event, auth).await {
@@ -901,21 +1017,25 @@ pub async fn query_events(
         })?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/query");
-    let (pubkey, event_id_bytes) = verify_bridge_auth(
-        &headers,
-        "POST",
-        &url,
-        Some(&body),
-        state.config.require_auth_token,
-    )?;
+    let (pubkey, event_id_bytes, scopes, channel_ids) =
+        resolve_bridge_principal(&state, &tenant, &headers, "POST", &url, Some(&body)).await?;
     let pubkey_hex = pubkey.to_hex();
 
     // Admission, replay, membership, and filter execution all run inside the
     // helper.  The single terminal attribution line fires here from the Result
     // so every outcome — including admission/replay/membership failures that
     // previously returned before any log — is attributed.
-    let result =
-        query_events_authed(&state, &tenant, &headers, &body, pubkey, event_id_bytes).await;
+    let result = query_events_authed(
+        &state,
+        &tenant,
+        &headers,
+        &body,
+        pubkey,
+        event_id_bytes,
+        &scopes,
+        channel_ids.as_deref(),
+    )
+    .await;
     match &result {
         Ok(Json(Value::Array(events))) => {
             tracing::info!(
@@ -944,6 +1064,7 @@ pub async fn query_events(
 /// Filter execution for [`query_events`], run once NIP-98 auth succeeds.
 /// Handles admission, replay, membership, and all filter paths so the thin
 /// wrapper above can emit exactly one terminal attribution line from the Result.
+#[allow(clippy::too_many_arguments)]
 async fn query_events_authed(
     state: &Arc<AppState>,
     tenant: &TenantContext,
@@ -951,7 +1072,10 @@ async fn query_events_authed(
     body: &[u8],
     pubkey: nostr::PublicKey,
     event_id_bytes: [u8; 32],
+    scopes: &[buzz_auth::Scope],
+    token_channel_ids: Option<&[uuid::Uuid]>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    enforce_read_scope(scopes)?;
     enforce_http_admission(state, tenant, &pubkey).await?;
     check_nip98_replay(state, tenant, event_id_bytes).await?;
     let pubkey_bytes = pubkey.to_bytes().to_vec();
@@ -998,10 +1122,15 @@ async fn query_events_authed(
     }
 
     // Get channels this user can access — same enforcement as WS REQ handler.
-    let accessible_channels = state
+    let mut accessible_channels = state
         .get_accessible_channel_ids_cached(tenant.community(), &pubkey_bytes)
         .await
         .map_err(|e| internal_error(&format!("channel access lookup: {e}")))?;
+    // Narrow to the bearer token's per-key channel restriction (apikey mode),
+    // mirroring the WS REQ handler. Membership stays the primary gate; a scoped
+    // token can never read outside its `channel_ids` even where its actor is a
+    // member. `None` (unrestricted token / nostr mode) leaves the set unchanged.
+    crate::handlers::req::narrow_to_token_channels(&mut accessible_channels, token_channel_ids);
 
     if filters.iter().any(|f| f.search.is_some()) {
         if has_mixed_search_filters(&filters) {
@@ -1015,6 +1144,7 @@ async fn query_events_authed(
             &raw_filters,
             &filters,
             &accessible_channels,
+            token_channel_ids.is_none(),
             tenant,
             &authed_pubkey_hex,
             &pubkey_bytes,
@@ -1334,21 +1464,25 @@ pub async fn count_events(
         })?;
 
     let url = nip98_expected_url(&state.config.relay_url, &tenant, "/count");
-    let (pubkey, event_id_bytes) = verify_bridge_auth(
-        &headers,
-        "POST",
-        &url,
-        Some(&body),
-        state.config.require_auth_token,
-    )?;
+    let (pubkey, event_id_bytes, scopes, channel_ids) =
+        resolve_bridge_principal(&state, &tenant, &headers, "POST", &url, Some(&body)).await?;
     let pubkey_hex = pubkey.to_hex();
 
     // Admission, replay, membership, and count execution all run inside the
     // helper.  The single terminal attribution line fires here from the Result
     // so every outcome — including admission/replay/membership failures that
     // previously returned before any log — is attributed.
-    let result =
-        count_events_authed(&state, &tenant, &headers, &body, pubkey, event_id_bytes).await;
+    let result = count_events_authed(
+        &state,
+        &tenant,
+        &headers,
+        &body,
+        pubkey,
+        event_id_bytes,
+        &scopes,
+        channel_ids.as_deref(),
+    )
+    .await;
     match &result {
         Ok(Json(value)) => {
             let count = value.get("count").and_then(Value::as_u64);
@@ -1375,6 +1509,7 @@ pub async fn count_events(
 /// Filter execution for [`count_events`], run once NIP-98 auth succeeds.
 /// Handles admission, replay, membership, and count execution so the thin
 /// wrapper above can emit exactly one terminal attribution line from the Result.
+#[allow(clippy::too_many_arguments)]
 async fn count_events_authed(
     state: &Arc<AppState>,
     tenant: &TenantContext,
@@ -1382,7 +1517,10 @@ async fn count_events_authed(
     body: &[u8],
     pubkey: nostr::PublicKey,
     event_id_bytes: [u8; 32],
+    scopes: &[buzz_auth::Scope],
+    token_channel_ids: Option<&[uuid::Uuid]>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    enforce_read_scope(scopes)?;
     enforce_http_admission(state, tenant, &pubkey).await?;
     check_nip98_replay(state, tenant, event_id_bytes).await?;
     let pubkey_bytes = pubkey.to_bytes().to_vec();
@@ -1421,10 +1559,14 @@ async fn count_events_authed(
     }
 
     // Get channels this user can access.
-    let accessible_channels = state
+    let mut accessible_channels = state
         .get_accessible_channel_ids_cached(tenant.community(), &pubkey_bytes)
         .await
         .map_err(|e| internal_error(&format!("channel access lookup: {e}")))?;
+    // Narrow to the bearer token's per-key channel restriction (apikey mode),
+    // mirroring the WS COUNT handler so a scoped token cannot COUNT events in
+    // channels outside its `channel_ids` via the no-channel-filter SQL pushdown.
+    crate::handlers::req::narrow_to_token_channels(&mut accessible_channels, token_channel_ids);
 
     let mut total: u64 = 0;
     for filter in &filters {
@@ -1613,21 +1755,27 @@ fn search_hit_accepted(
 
 /// Handle search filters by routing to Postgres FTS, then fetching full events
 /// from DB. Supports a bridge-only `page` extension over the FTS result set.
+#[allow(clippy::too_many_arguments)]
 async fn handle_bridge_search(
     state: &AppState,
     raw_filters: &[Value],
     filters: &[nostr::Filter],
     accessible_channels: &[uuid::Uuid],
+    include_global: bool,
     tenant: &buzz_core::tenant::TenantContext,
     reader_pubkey_hex: &str,
     pubkey_bytes: &[u8],
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    // Bridge always includes global (channel-less) events — same as WS with
-    // full scopes. `None` means no accessible channels and no global access →
-    // empty result set (the caller short-circuits exactly as the WS door EOSEs).
+    // `include_global` mirrors the WS search door: a bearer token with a per-key
+    // `channel_ids` restriction (apikey mode) must NOT surface channel-less /
+    // global search hits, exactly as `handle_search_req` scopes them out. An
+    // unrestricted principal (nostr mode, or a token with no channel narrowing)
+    // includes global events. `None` from the scope builder means no accessible
+    // channels and no global access → empty result set (the caller
+    // short-circuits exactly as the WS door EOSEs).
     let channel_scope = match crate::handlers::req::build_search_channel_scope_filter(
         accessible_channels,
-        true, // include_global
+        include_global,
     ) {
         Some(scope) => scope,
         None => return Ok(Json(Value::Array(Vec::new()))),
@@ -2029,8 +2177,11 @@ async fn authorize_moderation_read(
         _ => path.to_string(),
     };
     let url = nip98_expected_url(&state.config.relay_url, &tenant, &path_with_query);
-    let (pubkey, event_id_bytes) =
-        verify_bridge_auth(headers, "GET", &url, None, state.config.require_auth_token)?;
+    // Moderation reads authorize via `authorize_moderation_action` (moderator
+    // role), not scopes — but authentication still follows the active mode.
+    // Per-key `channel_ids` is irrelevant to the role-based moderation gate.
+    let (pubkey, event_id_bytes, _scopes, _channel_ids) =
+        resolve_bridge_principal(state, &tenant, headers, "GET", &url, None).await?;
     check_nip98_replay(state, &tenant, event_id_bytes).await?;
     let pubkey_bytes = pubkey.to_bytes().to_vec();
 

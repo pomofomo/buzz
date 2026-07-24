@@ -725,6 +725,34 @@ pub fn propagate_legacy_env_vars() {
     }
 }
 
+/// Returns `true` when the harness should operate in API-key (bearer) auth mode.
+///
+/// apikey mode is engaged when a bearer token is present in the harness
+/// environment (`BUZZ_API_KEY`) or when `BUZZ_AUTH_MODE` names the apikey
+/// doorway (`apikey` / `api_key` / `api-key`, case-insensitive). Otherwise the
+/// default nostr (NIP-42/98 + NIP-OA) doorway is used.
+///
+/// In apikey mode the NIP-OA `BUZZ_AUTH_TAG` credential is neither forwarded to
+/// managed agents nor used for owner resolution — the bearer key's stored scopes
+/// carry that authority instead.
+pub fn apikey_mode() -> bool {
+    if std::env::var("BUZZ_API_KEY")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    std::env::var("BUZZ_AUTH_MODE")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "apikey" | "api_key" | "api-key"
+            )
+        })
+        .unwrap_or(false)
+}
+
 impl Config {
     pub fn from_cli() -> Result<Self, ConfigError> {
         // Legacy env-var propagation is intentionally NOT done here.

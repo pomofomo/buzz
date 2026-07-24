@@ -1,5 +1,5 @@
-import 'dart:convert';
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:buzz/shared/relay/media_auth.dart';
 import 'package:buzz/shared/relay/media_image.dart';
@@ -7,7 +7,6 @@ import 'package:flutter/painting.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart' as http_testing;
-import 'package:nostr/nostr.dart' as nostr;
 
 // Minimal valid 1x1 transparent PNG.
 final _pngBytes = base64Decode(
@@ -17,9 +16,10 @@ final _pngBytes = base64Decode(
 
 const _relayBase = 'https://relay.example.com';
 const _mediaUrl = '$_relayBase/media/abc123.png';
+const _apiKey = 'buzzk_media_key';
 
-MediaGetAuthService _auth({String? nsec, DateTime Function()? now}) =>
-    MediaGetAuthService(baseUrl: _relayBase, nsec: nsec, now: now);
+MediaGetAuthService _auth({String? apiKey = _apiKey}) =>
+    MediaGetAuthService(baseUrl: _relayBase, apiKey: apiKey);
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
@@ -31,43 +31,43 @@ void main() {
     PaintingBinding.instance.imageCache.clearLiveImages();
   });
 
-  group('MediaGetAuthService memoization', () {
-    test('repeated calls return byte-identical headers', () {
-      final nsec = nostr.Keys.generate().nsec;
-      final auth = _auth(nsec: nsec);
-      final first = auth.headersFor(_mediaUrl);
-      final second = auth.headersFor(_mediaUrl);
-      expect(first, isNotEmpty);
-      expect(identical(first, second), isTrue);
-    });
-
-    test('re-signs only at the refresh margin before expiry', () {
-      final nsec = nostr.Keys.generate().nsec;
-      var current = DateTime.utc(2026, 7, 21, 12);
-      final auth = _auth(nsec: nsec, now: () => current);
-
-      final first = auth.headersFor(_mediaUrl);
-      // 600s lifetime - 60s margin = re-sign boundary at +540s.
-      current = current.add(const Duration(seconds: 539));
-      expect(identical(auth.headersFor(_mediaUrl), first), isTrue);
-
-      current = current.add(const Duration(seconds: 2));
-      final refreshed = auth.headersFor(_mediaUrl);
-      expect(identical(refreshed, first), isFalse);
-      expect(refreshed['Authorization'], isNot(first['Authorization']));
+  group('MediaGetAuthService bearer headers', () {
+    test('attaches Authorization: Bearer for relay media URLs', () {
+      final auth = _auth();
+      final headers = auth.headersFor(_mediaUrl);
+      expect(headers['Authorization'], 'Bearer $_apiKey');
     });
 
     test('non-relay URLs get no headers even with a key', () {
-      final nsec = nostr.Keys.generate().nsec;
-      final auth = _auth(nsec: nsec);
+      final auth = _auth();
       expect(auth.headersFor('https://elsewhere.com/media/abc.png'), isEmpty);
       expect(auth.headersFor('$_relayBase/not-media/abc.png'), isEmpty);
+    });
+
+    test('no key => no headers', () {
+      final auth = _auth(apiKey: null);
+      expect(auth.headersFor(_mediaUrl), isEmpty);
+    });
+
+    test('normalizes default ports and rejects path-prefix lookalikes', () {
+      final auth = MediaGetAuthService(
+        baseUrl: 'https://Relay.Example:443',
+        apiKey: _apiKey,
+      );
+      expect(
+        auth.headersFor('https://relay.example/media/abc.png'),
+        isNotEmpty,
+      );
+      expect(
+        auth.headersFor('https://relay.example/media-evil/abc.png'),
+        isEmpty,
+      );
     });
   });
 
   group('MediaImageProvider cache identity', () {
     test('equal url + same auth service => equal keys', () {
-      final auth = _auth(nsec: nostr.Keys.generate().nsec);
+      final auth = _auth();
       final client = http.Client();
       addTearDown(client.close);
       final a = MediaImageProvider(url: _mediaUrl, auth: auth, client: client);
@@ -81,19 +81,19 @@ void main() {
       addTearDown(client.close);
       final a = MediaImageProvider(
         url: _mediaUrl,
-        auth: _auth(nsec: nostr.Keys.generate().nsec),
+        auth: _auth(apiKey: 'buzzk_one'),
         client: client,
       );
       final b = MediaImageProvider(
         url: _mediaUrl,
-        auth: _auth(nsec: nostr.Keys.generate().nsec),
+        auth: _auth(apiKey: 'buzzk_two'),
         client: client,
       );
       expect(a, isNot(equals(b)));
     });
 
     test('transport client is not part of identity', () {
-      final auth = _auth(nsec: nostr.Keys.generate().nsec);
+      final auth = _auth();
       final c1 = http.Client();
       final c2 = http.Client();
       addTearDown(c1.close);
@@ -112,7 +112,7 @@ void main() {
         fetches += 1;
         return http.Response.bytes(_pngBytes, 200);
       });
-      final auth = _auth(nsec: nostr.Keys.generate().nsec);
+      final auth = _auth();
 
       for (var i = 0; i < 3; i++) {
         final provider = MediaImageProvider(
@@ -126,20 +126,20 @@ void main() {
       expect(fetches, 1);
     });
 
-    test('sends auth headers with the fetch', () async {
+    test('sends bearer auth headers with the fetch', () async {
       Map<String, String>? seen;
       final client = http_testing.MockClient((request) async {
         seen = request.headers;
         return http.Response.bytes(_pngBytes, 200);
       });
-      final auth = _auth(nsec: nostr.Keys.generate().nsec);
+      final auth = _auth();
       final provider = MediaImageProvider(
         url: _mediaUrl,
         auth: auth,
         client: client,
       );
       await _wait(provider.resolve(ImageConfiguration.empty));
-      expect(seen?['Authorization'], startsWith('Nostr '));
+      expect(seen?['Authorization'], 'Bearer $_apiKey');
     });
 
     test('failed URL is not refetched until cooldown elapses', () async {
@@ -148,7 +148,7 @@ void main() {
         fetches += 1;
         return http.Response('rate limited', 429);
       });
-      final auth = _auth(nsec: nostr.Keys.generate().nsec);
+      final auth = _auth();
       var current = DateTime.utc(2026, 7, 21, 12);
       MediaImageProvider.debugNow = () => current;
 
@@ -184,7 +184,7 @@ void main() {
           headers: {'retry-after': '120'},
         );
       });
-      final auth = _auth(nsec: nostr.Keys.generate().nsec);
+      final auth = _auth();
       var current = DateTime.utc(2026, 7, 21, 12);
       MediaImageProvider.debugNow = () => current;
 

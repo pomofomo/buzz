@@ -806,16 +806,20 @@ dependencies = [
  "buzz-pubsub",
  "buzz-search",
  "buzz-workflow",
+ "chrono",
  "clap",
  "deadpool-redis",
  "hex",
  "nostr",
+ "rand 0.10.1",
  "rustls",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "tokio",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -851,6 +855,7 @@ dependencies = [
  "chrono",
  "futures-util",
  "hex",
+ "rust-s3",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -866,12 +871,15 @@ name = "buzz-auth"
 version = "0.1.0"
 dependencies = [
  "buzz-core",
+ "buzz-db",
+ "chrono",
  "hex",
  "nostr",
  "rand 0.10.1",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "sqlx",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -966,7 +974,6 @@ dependencies = [
  "buzz-cli",
  "buzz-core",
  "git-credential-nostr",
- "git-sign-nostr",
  "ignore",
  "image",
  "nix 0.31.3",
@@ -984,7 +991,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "windows-sys 0.61.2",
- "zeroize",
 ]
 
 [[package]]
@@ -1015,40 +1021,6 @@ dependencies = [
  "tracing",
  "ulid",
  "uuid",
-]
-
-[[package]]
-name = "buzz-pair-relay"
-version = "0.1.0"
-dependencies = [
- "futures-util",
- "http-body-util",
- "hyper",
- "hyper-util",
- "parking_lot",
- "secp256k1 0.31.1",
- "serde_json",
- "sha2 0.11.0",
- "tokio",
- "tokio-tungstenite 0.29.0",
- "tokio-util",
-]
-
-[[package]]
-name = "buzz-pairing-cli"
-version = "0.1.0"
-dependencies = [
- "buzz-core",
- "clap",
- "futures-util",
- "hex",
- "nostr",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tokio-tungstenite 0.29.0",
- "url",
- "zeroize",
 ]
 
 [[package]]
@@ -1233,7 +1205,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64",
+ "buzz-auth",
  "buzz-core",
+ "buzz-db",
  "buzz-sdk",
  "buzz-ws-client",
  "chrono",
@@ -3080,25 +3054,6 @@ dependencies = [
 [[package]]
 name = "git-credential-nostr"
 version = "0.1.0"
-dependencies = [
- "base64",
- "nostr",
- "serde_json",
- "zeroize",
-]
-
-[[package]]
-name = "git-sign-nostr"
-version = "0.1.0"
-dependencies = [
- "base64",
- "chrono",
- "hex",
- "libc",
- "nostr",
- "serde_json",
- "zeroize",
-]
 
 [[package]]
 name = "git-version"
@@ -5469,7 +5424,7 @@ dependencies = [
  "hex",
  "instant",
  "scrypt",
- "secp256k1 0.29.1",
+ "secp256k1",
  "serde",
  "serde_json",
  "unicode-normalization",
@@ -7725,19 +7680,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9465315bc9d4566e1724f0fffcbcc446268cb522e60f9a27bcded6b19c108113"
 dependencies = [
  "rand 0.8.6",
- "secp256k1-sys 0.10.1",
+ "secp256k1-sys",
  "serde",
-]
-
-[[package]]
-name = "secp256k1"
-version = "0.31.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2c3c81b43dc2d8877c216a3fccf76677ee1ebccd429566d3e67447290d0c42b2"
-dependencies = [
- "bitcoin_hashes",
- "rand 0.9.4",
- "secp256k1-sys 0.11.0",
 ]
 
 [[package]]
@@ -7745,15 +7689,6 @@ name = "secp256k1-sys"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d4387882333d3aa8cb20530a17c69a3752e97837832f34f6dccc760e715001d9"
-dependencies = [
- "cc",
-]
-
-[[package]]
-name = "secp256k1-sys"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dcb913707158fadaf0d8702c2db0e857de66eb003ccfdda5924b5f5ac98efb38"
 dependencies = [
  "cc",
 ]

@@ -102,22 +102,27 @@ void main() {
       expect(result, isEmpty);
     });
 
-    test('save and loadAll round-trips a community', () async {
-      final ws = Community.create(
-        name: 'Test',
-        relayUrl: 'https://relay.example.com',
-        pubkey: 'abc123',
-      );
+    test(
+      'save and loadAll round-trips a community with API-key credentials',
+      () async {
+        final ws = Community.create(
+          name: 'Test',
+          relayUrl: 'https://relay.example.com',
+          pubkey: 'abc123',
+          apiKey: 'buzzk_secret',
+        );
 
-      await storage.save(ws);
-      final loaded = await storage.loadAll();
+        await storage.save(ws);
+        final loaded = await storage.loadAll();
 
-      expect(loaded, hasLength(1));
-      expect(loaded.first.id, ws.id);
-      expect(loaded.first.name, 'Test');
-      expect(loaded.first.relayUrl, 'https://relay.example.com');
-      expect(loaded.first.pubkey, 'abc123');
-    });
+        expect(loaded, hasLength(1));
+        expect(loaded.first.id, ws.id);
+        expect(loaded.first.name, 'Test');
+        expect(loaded.first.relayUrl, 'https://relay.example.com');
+        expect(loaded.first.pubkey, 'abc123');
+        expect(loaded.first.apiKey, 'buzzk_secret');
+      },
+    );
 
     test('save updates existing community with same id', () async {
       final ws = Community.create(
@@ -170,6 +175,7 @@ void main() {
         final legacy = Community.create(
           name: 'Legacy',
           relayUrl: 'https://legacy.example.com',
+          apiKey: 'buzzk_legacy',
         );
         fakeSecure['buzz_workspaces'] = jsonEncode([legacy.toJson()]);
         fakeSecure['buzz_active_workspace_id'] = legacy.id;
@@ -183,30 +189,33 @@ void main() {
         expect(fakeSecure['buzz_active_workspace_id'], isNull);
       });
 
-      test('migrates legacy keys to community on first load', () async {
-        fakeSecure['buzz_relay_url'] = 'https://legacy.example.com';
-        fakeSecure['buzz_token'] = 'legacy_token';
-        fakeSecure['buzz_pubkey'] = 'legacy_pub';
-        fakeSecure['buzz_nsec'] = 'legacy_nsec';
+      test(
+        'migrates legacy single-community keys to an API-key community',
+        () async {
+          // The legacy `buzz_token` becomes the community's bearer API key; the
+          // legacy `buzz_pubkey` becomes the actor id.
+          fakeSecure['buzz_relay_url'] = 'https://legacy.example.com';
+          fakeSecure['buzz_token'] = 'legacy_token';
+          fakeSecure['buzz_pubkey'] = 'legacy_pub';
 
-        final loaded = await storage.loadAll();
+          final loaded = await storage.loadAll();
 
-        expect(loaded, hasLength(1));
-        expect(loaded.first.relayUrl, 'https://legacy.example.com');
-        expect(loaded.first.pubkey, 'legacy_pub');
-        expect(loaded.first.nsec, 'legacy_nsec');
-        expect(loaded.first.name, isNotEmpty);
+          expect(loaded, hasLength(1));
+          expect(loaded.first.relayUrl, 'https://legacy.example.com');
+          expect(loaded.first.pubkey, 'legacy_pub');
+          expect(loaded.first.apiKey, 'legacy_token');
+          expect(loaded.first.name, isNotEmpty);
 
-        // Legacy keys should be deleted.
-        expect(fakeSecure['buzz_relay_url'], isNull);
-        expect(fakeSecure['buzz_token'], isNull);
-        expect(fakeSecure['buzz_pubkey'], isNull);
-        expect(fakeSecure['buzz_nsec'], isNull);
+          // Legacy keys should be deleted.
+          expect(fakeSecure['buzz_relay_url'], isNull);
+          expect(fakeSecure['buzz_token'], isNull);
+          expect(fakeSecure['buzz_pubkey'], isNull);
 
-        // Active ID should be set.
-        final activeId = await storage.loadActiveId();
-        expect(activeId, loaded.first.id);
-      });
+          // Active ID should be set.
+          final activeId = await storage.loadActiveId();
+          expect(activeId, loaded.first.id);
+        },
+      );
 
       test('does not migrate when no legacy keys exist', () async {
         final loaded = await storage.loadAll();

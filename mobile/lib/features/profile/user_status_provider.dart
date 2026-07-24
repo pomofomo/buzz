@@ -1,5 +1,4 @@
 import 'package:hooks_riverpod/hooks_riverpod.dart';
-import 'package:nostr/nostr.dart' as nostr;
 
 import '../../shared/relay/relay.dart';
 import 'user_status.dart';
@@ -20,17 +19,9 @@ class UserStatusNotifier extends AsyncNotifier<UserStatus?> {
 
   Future<UserStatus?> _fetch() async {
     final config = ref.read(relayConfigProvider);
-    final nsec = config.nsec;
-    if (nsec == null || nsec.isEmpty) return null;
-
-    String pubkey;
-    try {
-      final privkeyHex = nostr.Nip19.decode(payload: nsec).data;
-      final keyPair = nostr.Keys(privkeyHex);
-      pubkey = keyPair.public.toLowerCase();
-    } catch (_) {
-      return null;
-    }
+    final actor = config.actorPubkey?.trim();
+    if (actor == null || actor.isEmpty) return null;
+    final pubkey = actor.toLowerCase();
 
     final sessionState = ref.read(relaySessionProvider);
     if (sessionState.status != SessionStatus.connected) return null;
@@ -64,8 +55,8 @@ class UserStatusNotifier extends AsyncNotifier<UserStatus?> {
   Future<void> setStatus(String text, String emoji) async {
     final trimmed = text.trim();
     final config = ref.read(relayConfigProvider);
-    final nsec = config.nsec;
-    if (nsec == null || nsec.isEmpty) return;
+    final actor = config.actorPubkey?.trim();
+    if (actor == null || actor.isEmpty) return;
 
     final tags = <List<String>>[
       ['d', 'general'],
@@ -74,17 +65,15 @@ class UserStatusNotifier extends AsyncNotifier<UserStatus?> {
       tags.add(['emoji', emoji]);
     }
 
-    final privkeyHex = nostr.Nip19.decode(payload: nsec).data;
-    final event = nostr.Event.from(
+    final relay = SignedEventRelay(
+      session: ref.read(relaySessionProvider.notifier),
+      actorPubkey: actor,
+    );
+    await relay.submit(
       kind: EventKind.userStatus,
       content: trimmed,
       tags: tags,
-      secretKey: privkeyHex,
-      verify: false,
     );
-
-    final session = ref.read(relaySessionProvider.notifier);
-    await session.publish(NostrEvent.fromJson(event.toMap()));
 
     // Optimistic update: update own state immediately.
     final newStatus = (trimmed.isNotEmpty || emoji.isNotEmpty)
@@ -97,8 +86,7 @@ class UserStatusNotifier extends AsyncNotifier<UserStatus?> {
     state = AsyncValue.data(newStatus);
 
     // Also update the shared cache so other UI reads stay consistent.
-    final keyPair = nostr.Keys(privkeyHex);
-    final pubkey = keyPair.public.toLowerCase();
+    final pubkey = actor.toLowerCase();
     ref.read(userStatusCacheProvider.notifier).updateStatus(pubkey, newStatus);
   }
 

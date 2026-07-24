@@ -53,6 +53,23 @@ pub enum AuthError {
     #[error("channel access denied")]
     ChannelAccessDenied,
 
+    /// The presented API-key bearer token did not resolve to an active token
+    /// (unknown hash, revoked, or scoped to a different community).
+    ///
+    /// The message is intentionally generic — it does not distinguish "unknown"
+    /// from "revoked" so a caller cannot probe token existence.
+    #[error("invalid or revoked API token")]
+    InvalidToken,
+
+    /// The presented API-key bearer token has passed its `expires_at`.
+    #[error("API token expired")]
+    TokenExpired,
+
+    /// An auth path was invoked that is not enabled under the active
+    /// [`crate::AuthMode`] (e.g. a NIP-42 challenge in `apikey` mode).
+    #[error("auth method not enabled for the active auth mode")]
+    AuthModeMismatch,
+
     /// An unexpected internal error occurred (e.g. a `spawn_blocking` panic).
     #[error("internal auth error: {0}")]
     Internal(String),

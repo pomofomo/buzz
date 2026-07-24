@@ -2,9 +2,7 @@ import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
-import 'package:nostr/nostr.dart' as nostr;
 
-import '../../../shared/crypto/nip44.dart';
 import '../../../shared/relay/relay.dart';
 import 'observer_models.dart';
 import 'transcript_builder.dart';
@@ -55,11 +53,9 @@ class ObserverRelayState {
 class ObserverRelayNotifier extends Notifier<ObserverRelayState> {
   final Map<String, List<ObserverFrame>> _framesByAgent = {};
   final Map<String, Set<String>> _dedupeKeysByAgent = {};
-  final Map<String, Uint8List> _conversationKeysByAgent = {};
 
   void Function()? _unsubscribe;
   Future<void>? _startFuture;
-  String? _privHex;
   String? _ownerPubkey;
   String? _identityKey;
   String? _errorMessage;
@@ -70,7 +66,7 @@ class ObserverRelayNotifier extends Notifier<ObserverRelayState> {
   ObserverRelayState build() {
     final config = ref.watch(relayConfigProvider);
     final sessionState = ref.watch(relaySessionProvider);
-    final identityKey = '${config.baseUrl}|${config.nsec ?? ''}';
+    final identityKey = '${config.baseUrl}|${config.actorPubkey ?? ''}';
 
     _disposed = false;
     if (_identityKey != null && _identityKey != identityKey) {
@@ -87,9 +83,9 @@ class ObserverRelayNotifier extends Notifier<ObserverRelayState> {
       Future.microtask(_ensureSubscribed);
     }
 
-    final hasSigningKey = config.nsec?.isNotEmpty == true;
+    final hasActor = config.actorPubkey?.isNotEmpty == true;
     return ObserverRelayState(
-      connection: hasSigningKey
+      connection: hasActor
           ? _connectionForSession(sessionState.status)
           : ObserverConnectionState.idle,
       framesByAgent: _snapshotFrames(),
@@ -113,19 +109,17 @@ class ObserverRelayNotifier extends Notifier<ObserverRelayState> {
       }
 
       final config = ref.read(relayConfigProvider);
-      final nsec = config.nsec;
-      if (nsec == null || nsec.isEmpty) {
+      final actor = config.actorPubkey?.trim();
+      if (actor == null || actor.isEmpty) {
         _errorMessage = null;
         _emit(connection: ObserverConnectionState.idle);
         return;
       }
 
-      final privHex = _decodePrivkey(nsec);
-      final ownerPubkey = _derivePubkey(privHex);
+      final ownerPubkey = actor.toLowerCase();
       if (_disposed || epoch != _subscriptionEpoch) {
         return;
       }
-      _privHex = privHex;
       _ownerPubkey = ownerPubkey;
       _errorMessage = null;
       _emit(connection: ObserverConnectionState.connecting);
@@ -179,8 +173,7 @@ class ObserverRelayNotifier extends Notifier<ObserverRelayState> {
     }
 
     final ownerPubkey = _ownerPubkey;
-    final privHex = _privHex;
-    if (ownerPubkey == null || privHex == null) {
+    if (ownerPubkey == null) {
       return;
     }
 
@@ -189,7 +182,7 @@ class ObserverRelayNotifier extends Notifier<ObserverRelayState> {
       return;
     }
 
-    final frame = _decryptFrame(event, normalizedAgent, privHex);
+    final frame = _parseFrame(event);
     if (frame == null) return;
 
     final dedupeKey = '${frame.seq}:${frame.timestamp}';
@@ -220,21 +213,14 @@ class ObserverRelayNotifier extends Notifier<ObserverRelayState> {
     _emit(connection: ObserverConnectionState.open);
   }
 
-  ObserverFrame? _decryptFrame(
-    NostrEvent event,
-    String normalizedAgent,
-    String privHex,
-  ) {
+  ObserverFrame? _parseFrame(NostrEvent event) {
+    // Observer frames are now server-side plaintext (E2E dropped in the
+    // API-key migration); the relay gates them by scope + `#p` membership.
     try {
-      final conversationKey = _conversationKeysByAgent.putIfAbsent(
-        normalizedAgent,
-        () => getConversationKey(privHex, normalizedAgent),
-      );
-      final plaintext = nip44Decrypt(conversationKey, event.content);
-      final json = jsonDecode(plaintext) as Map<String, dynamic>;
+      final json = jsonDecode(event.content) as Map<String, dynamic>;
       return ObserverFrame.fromJson(json);
     } catch (error) {
-      _errorMessage = 'Observer event decrypt failed: $error';
+      _errorMessage = 'Observer event parse failed: $error';
       _emit(connection: ObserverConnectionState.error);
       return null;
     }
@@ -261,32 +247,10 @@ class ObserverRelayNotifier extends Notifier<ObserverRelayState> {
     _unsubscribe?.call();
     _unsubscribe = null;
     _startFuture = null;
-    _privHex = null;
     _ownerPubkey = null;
     _errorMessage = null;
     _framesByAgent.clear();
     _dedupeKeysByAgent.clear();
-    _conversationKeysByAgent.clear();
-  }
-
-  static String _decodePrivkey(String nsec) {
-    try {
-      final privHex = nostr.Nip19.decode(payload: nsec).data;
-      if (privHex.isEmpty) {
-        throw const FormatException('empty private key');
-      }
-      return privHex;
-    } catch (_) {
-      throw const FormatException('failed to decode private key');
-    }
-  }
-
-  static String _derivePubkey(String privHex) {
-    try {
-      return nostr.Keys(privHex).public;
-    } catch (_) {
-      throw const FormatException('failed to derive pubkey');
-    }
   }
 
   ObserverConnectionState _connectionForSession(SessionStatus status) {

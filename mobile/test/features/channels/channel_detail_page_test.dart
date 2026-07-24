@@ -1354,7 +1354,7 @@ class _FakeChannelActions extends ChannelActions {
         session: ref.read(relaySessionProvider.notifier),
         signedEventRelay: SignedEventRelay(
           session: ref.read(relaySessionProvider.notifier),
-          nsec: null,
+          actorPubkey: null,
         ),
         currentPubkey: 'self',
       );

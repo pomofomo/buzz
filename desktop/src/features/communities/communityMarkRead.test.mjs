@@ -98,19 +98,15 @@ test("publishCommunityReadState publishes one read-state event covering observed
     channelIds: ["chan-1", "chan-2"],
     metadata: [metadataEvent("chan-1"), metadataEvent("chan-2")],
   });
-  const encrypted = [];
+  let signCount = 0;
 
   await publishCommunityReadState({
     client,
     pubkey: PUBKEY,
     relayUrl: "wss://relay.example",
     nowSeconds: READ_AT,
-    encrypt: async (plaintext) => {
-      encrypted.push(plaintext);
-      return `cipher:${encrypted.length}`;
-    },
     sign: async (input) => ({
-      id: `signed-${encrypted.length}`,
+      id: `signed-${++signCount}`,
       pubkey: PUBKEY,
       created_at: input.createdAt,
       kind: input.kind,
@@ -133,7 +129,8 @@ test("publishCommunityReadState publishes one read-state event covering observed
     event.tags.some((tag) => tag[0] === "t" && tag[1] === "read-state"),
   );
 
-  const blob = JSON.parse(encrypted[0]);
+  // Content is stored as plaintext JSON (no encryption step).
+  const blob = JSON.parse(event.content);
   assert.equal(blob.v, 1);
   assert.deepEqual(blob.contexts, { "chan-1": READ_AT, "chan-2": READ_AT });
 });
@@ -149,7 +146,6 @@ test("publishCommunityReadState skips archived channels and publishes nothing wh
     pubkey: PUBKEY,
     relayUrl: "wss://relay.example",
     nowSeconds: READ_AT,
-    encrypt: async (plaintext) => plaintext,
     sign: async () => {
       throw new Error("must not sign when there is nothing to publish");
     },
@@ -164,7 +160,6 @@ test("publishCommunityReadState reuses stable slot ids so blobs are replaceable"
     pubkey: PUBKEY,
     relayUrl: "wss://relay.example",
     nowSeconds: READ_AT,
-    encrypt: async (plaintext) => plaintext,
     sign: async (input) => ({
       id: Math.random().toString(),
       pubkey: PUBKEY,

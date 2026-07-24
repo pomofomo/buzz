@@ -23,7 +23,12 @@ pub struct AuditEntry {
     pub prev_hash: Option<Vec<u8>>,
     /// Action that was performed.
     pub action: AuditAction,
-    /// Raw bytes of the actor's Nostr pubkey, if the action has one.
+    /// Opaque actor id — the raw bytes of the authenticated principal, if the
+    /// action has one. Post-cutover this holds the opaque actor id derived from
+    /// the presented API key; for legacy (Nostr-era) rows it is the actor's
+    /// Nostr pubkey. The column name is retained for schema stability
+    /// (decision #4: no DDL change); only the field's semantics widened. The
+    /// audit crate treats it as opaque bytes and folds it into the chain hash.
     pub actor_pubkey: Option<Vec<u8>>,
     /// Generic identifier of the object acted upon (event id hex, channel UUID,
     /// media sha256, …), if any. The relay resolves it under `community_id`;
@@ -57,7 +62,10 @@ pub struct NewAuditEntry {
     pub community_id: CommunityId,
     /// Action that was performed.
     pub action: AuditAction,
-    /// Raw bytes of the actor's Nostr pubkey, if the action has one.
+    /// Opaque actor id — the raw bytes of the authenticated principal, if the
+    /// action has one. Post-cutover this is the opaque actor id derived from
+    /// the API key; for legacy rows it is the actor's Nostr pubkey. Opaque
+    /// bytes to the audit crate; folded into the chain hash.
     pub actor_pubkey: Option<Vec<u8>>,
     /// Generic identifier of the object acted upon, if any.
     pub object_id: Option<String>,

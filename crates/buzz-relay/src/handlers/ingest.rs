@@ -81,13 +81,34 @@ pub enum IngestAuth {
         /// How the HTTP request was authenticated.
         auth_method: HttpAuthMethod,
     },
+    /// API-key (bearer) authenticated principal — `apikey` auth mode.
+    ///
+    /// Built by both the WebSocket (`handle_event`) and HTTP (`submit_event`)
+    /// ingest doorways once the bearer token has been resolved to an
+    /// [`buzz_auth::AuthContext`]. Transport-neutral: in `apikey` mode the relay
+    /// server-authors the row from the authenticated `actor` regardless of which
+    /// door the intent arrived through, so this single variant carries no
+    /// transport marker.
+    ApiKey {
+        /// The authenticated opaque 32-byte actor id (carried in the retained
+        /// `pubkey`-shaped field per refactor decision #2). The relay stamps
+        /// this as the event author; the client does not supply a signed author.
+        actor: nostr::PublicKey,
+        /// The token's stored permission scopes — granted exactly, never
+        /// [`Scope::all_known`].
+        scopes: Vec<Scope>,
+        /// The token's optional per-key channel restriction (`None` =
+        /// unrestricted).
+        channel_ids: Option<Vec<Uuid>>,
+    },
 }
 
 impl IngestAuth {
-    /// The authenticated public key.
+    /// The authenticated public key (the actor id in `apikey` mode).
     pub fn pubkey(&self) -> &nostr::PublicKey {
         match self {
             Self::Nip42 { pubkey, .. } | Self::Http { pubkey, .. } => pubkey,
+            Self::ApiKey { actor, .. } => actor,
         }
     }
 
@@ -99,7 +120,9 @@ impl IngestAuth {
     /// Permission scopes for this auth context.
     pub fn scopes(&self) -> &[Scope] {
         match self {
-            Self::Nip42 { scopes, .. } | Self::Http { scopes, .. } => scopes,
+            Self::Nip42 { scopes, .. }
+            | Self::Http { scopes, .. }
+            | Self::ApiKey { scopes, .. } => scopes,
         }
     }
 
@@ -107,21 +130,37 @@ impl IngestAuth {
     pub fn conn_id(&self) -> Option<Uuid> {
         match self {
             Self::Nip42 { conn_id, .. } => Some(*conn_id),
-            Self::Http { .. } => None,
+            Self::Http { .. } | Self::ApiKey { .. } => None,
         }
     }
 
-    /// Token-level channel restriction (WS connections with scoped tokens — legacy).
-    /// In pure Nostr mode this always returns None; channel access is enforced
-    /// via NIP-29 membership checks instead.
+    /// Token-level channel restriction.
+    ///
+    /// In `nostr` mode (`Nip42`/`Http`) channel access is enforced via NIP-29
+    /// membership checks and this returns the legacy WS token restriction (if
+    /// any). In `apikey` mode this returns the bearer key's per-key `channel_ids`
+    /// narrowing — the API-key trust model's optional channel scoping.
     pub fn channel_ids(&self) -> Option<&[Uuid]> {
         match self {
             Self::Nip42 {
                 channel_ids: Some(ids),
                 ..
+            }
+            | Self::ApiKey {
+                channel_ids: Some(ids),
+                ..
             } => Some(ids),
             _ => None,
         }
+    }
+
+    /// Whether this auth context is server-authoring (`apikey` mode).
+    ///
+    /// When `true`, the write path skips client-signature verification and the
+    /// relay stamps the actor/id/sig itself
+    /// ([`buzz_core::authoring::author_event_server_side`]).
+    pub fn is_server_authored(&self) -> bool {
+        matches!(self, Self::ApiKey { .. })
     }
 
     /// Whether this auth context is an HTTP request (not WebSocket).
@@ -1079,8 +1118,7 @@ fn validate_persona_envelope(event: &Event) -> Result<(), String> {
 /// This is an envelope sanity check, not full validation: the MAC and actual
 /// decryption happen at the reader. The intent is to refuse obvious junk so a
 /// malformed event cannot win NIP-33 replacement against a valid head and then
-/// be silently skipped by `validate_and_decrypt`. Mirrors the validator in
-/// `buzz-pair-relay::validate_nip44_content`.
+/// be silently skipped by `validate_and_decrypt`.
 fn validate_engram_nip44_content(content: &str) -> Result<(), String> {
     if content.is_empty() {
         return Err("agent-engram content must not be empty (NIP-44 ciphertext)".to_string());
@@ -1428,10 +1466,12 @@ async fn ingest_event_inner(
     state: &Arc<AppState>,
     tracer: &Arc<dyn buzz_conformance::Tracer>,
     tenant: &TenantContext,
-    event: Event,
+    mut event: Event,
     auth: IngestAuth,
 ) -> Result<IngestResult, IngestError> {
-    let event_id_hex = event.id.to_hex();
+    // In `apikey` mode the id is recomputed server-side after authoring, so this
+    // is refreshed below; in `nostr` mode it is the client-supplied id.
+    let mut event_id_hex = event.id.to_hex();
     let kind_u32 = event_kind_u32(&event);
     debug!(event_id = %event_id_hex, kind = kind_u32, "ingest_event");
 
@@ -1456,26 +1496,42 @@ async fn ingest_event_inner(
         return Err(IngestError::Rejected("restricted: relay-only kind".into()));
     }
 
-    // Share the event with the verify task via Arc instead of deep-cloning it
-    // (tags + up to 256 KB of content). spawn_blocking only needs 'static, not
-    // ownership; once it completes its Arc is dropped, so try_unwrap returns
-    // the original event without ever having copied it.
-    let event = std::sync::Arc::new(event);
-    let event_for_verify = std::sync::Arc::clone(&event);
-    let verify_result = tokio::task::spawn_blocking(move || verify_event(&event_for_verify)).await;
-    match verify_result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            return Err(IngestError::Rejected(format!("invalid: {e}")));
+    // Two write paths, selected by auth mode:
+    //
+    // - `apikey` mode (server-authored): the client sent an UNSIGNED intent
+    //   envelope. There is no client signature to verify. Instead the relay
+    //   *authors* the row — stamping the authenticated actor as the event
+    //   author, recomputing the NIP-01 id over the server-controlled fields, and
+    //   clearing the signature. The id changes, so refresh `event_id_hex`.
+    // - `nostr` mode (signed): verify the event id hash + Schnorr signature
+    //   off-thread. Unchanged pre-refactor behaviour.
+    if auth.is_server_authored() {
+        buzz_core::authoring::author_event_server_side(&mut event, *auth.pubkey())
+            .map_err(|e| IngestError::Internal(format!("error: server authoring failed: {e}")))?;
+        event_id_hex = event.id.to_hex();
+    } else {
+        // Share the event with the verify task via Arc instead of deep-cloning it
+        // (tags + up to 256 KB of content). spawn_blocking only needs 'static, not
+        // ownership; once it completes its Arc is dropped, so try_unwrap returns
+        // the original event without ever having copied it.
+        let event_arc = std::sync::Arc::new(event);
+        let event_for_verify = std::sync::Arc::clone(&event_arc);
+        let verify_result =
+            tokio::task::spawn_blocking(move || verify_event(&event_for_verify)).await;
+        match verify_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                return Err(IngestError::Rejected(format!("invalid: {e}")));
+            }
+            Err(e) => {
+                error!("spawn_blocking panicked: {e}");
+                return Err(IngestError::Internal(
+                    "error: internal verification error".into(),
+                ));
+            }
         }
-        Err(e) => {
-            error!("spawn_blocking panicked: {e}");
-            return Err(IngestError::Internal(
-                "error: internal verification error".into(),
-            ));
-        }
+        event = std::sync::Arc::try_unwrap(event_arc).unwrap_or_else(|arc| (*arc).clone());
     }
-    let event = std::sync::Arc::try_unwrap(event).unwrap_or_else(|arc| (*arc).clone());
 
     const MAX_TIMESTAMP_DRIFT_SECS: i64 = 900; // ±15 minutes
     let now = chrono::Utc::now().timestamp();
@@ -1495,8 +1551,12 @@ async fn ingest_event_inner(
         )));
     }
 
+    // In `nostr` mode the client-signed author must match the authenticated
+    // identity (the gift-wrap exception carries a per-message ephemeral author).
+    // In `apikey` mode the server just stamped `event.pubkey` to the actor, so
+    // this equality holds by construction and the check is skipped.
     let is_gift_wrap = kind_u32 == KIND_GIFT_WRAP;
-    if event.pubkey != *auth.pubkey() && !is_gift_wrap {
+    if !auth.is_server_authored() && event.pubkey != *auth.pubkey() && !is_gift_wrap {
         return Err(IngestError::AuthFailed(
             "invalid: event pubkey does not match authenticated identity".into(),
         ));
@@ -2978,6 +3038,96 @@ mod tests {
             !ws_auth.is_http(),
             "Nip42 variant should return false for is_http()"
         );
+    }
+
+    #[test]
+    fn apikey_variant_exposes_actor_scopes_and_channels() {
+        use crate::handlers::ingest::IngestAuth;
+        let actor = nostr::Keys::generate().public_key();
+        let ch = Uuid::new_v4();
+        let auth = IngestAuth::ApiKey {
+            actor,
+            scopes: vec![Scope::MessagesWrite],
+            channel_ids: Some(vec![ch]),
+        };
+        // `.pubkey()` returns the actor id.
+        assert_eq!(*auth.pubkey(), actor);
+        assert_eq!(auth.principal_pubkey_bytes(), actor.to_bytes().to_vec());
+        // `.scopes()` returns exactly the token's scopes.
+        assert_eq!(auth.scopes(), &[Scope::MessagesWrite]);
+        // Per-key channel restriction is surfaced.
+        assert_eq!(auth.channel_ids(), Some([ch].as_slice()));
+        // Server-authoring flag on; not HTTP; no conn id.
+        assert!(auth.is_server_authored());
+        assert!(!auth.is_http());
+        assert_eq!(auth.conn_id(), None);
+    }
+
+    #[test]
+    fn apikey_variant_unrestricted_channels_is_none() {
+        use crate::handlers::ingest::IngestAuth;
+        let auth = IngestAuth::ApiKey {
+            actor: nostr::Keys::generate().public_key(),
+            scopes: vec![],
+            channel_ids: None,
+        };
+        assert_eq!(auth.channel_ids(), None);
+    }
+
+    #[test]
+    fn nostr_variants_are_not_server_authored() {
+        use crate::handlers::ingest::{HttpAuthMethod, IngestAuth};
+        let keys = nostr::Keys::generate();
+        let ws = IngestAuth::Nip42 {
+            pubkey: keys.public_key(),
+            scopes: vec![],
+            channel_ids: None,
+            conn_id: Uuid::new_v4(),
+        };
+        let http = IngestAuth::Http {
+            pubkey: keys.public_key(),
+            scopes: vec![],
+            auth_method: HttpAuthMethod::Nip98,
+        };
+        assert!(!ws.is_server_authored());
+        assert!(!http.is_server_authored());
+    }
+
+    /// Server authoring (apikey mode): the relay stamps the actor as author,
+    /// recomputes a 32-byte content-hash id, and clears the signature — while a
+    /// client-supplied author/id/sig are ignored. This is the buzz-core helper
+    /// the ingest path invokes when `auth.is_server_authored()`.
+    #[test]
+    fn server_authoring_stamps_actor_id_and_empty_sig() {
+        let actor = nostr::Keys::generate().public_key();
+        // An "intent" that (as if from a hostile client) claims a different
+        // author and a bogus id.
+        let mut intent = make_event_with_tags(9, "hello world", &[&["h", "some-channel"]]);
+        let claimed_author = intent.pubkey;
+        assert_ne!(claimed_author, actor);
+
+        buzz_core::authoring::author_event_server_side(&mut intent, actor)
+            .expect("server authoring");
+
+        // Actor stamped as author (client claim discarded).
+        assert_eq!(intent.pubkey, actor);
+        // Id recomputed server-side over the stamped fields, 32 bytes.
+        assert_eq!(intent.id.as_bytes().len(), 32);
+        assert_eq!(
+            intent.id,
+            nostr::EventId::new(
+                &actor,
+                &intent.created_at,
+                &intent.kind,
+                &intent.tags,
+                "hello world"
+            )
+        );
+        // Signature cleared to the all-zero placeholder.
+        assert_eq!(intent.sig.serialize(), [0u8; 64]);
+        // Request fields (kind/content/tags) preserved.
+        assert_eq!(intent.content, "hello world");
+        assert_eq!(event_kind_u32(&intent), 9);
     }
 
     #[test]

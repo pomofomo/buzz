@@ -144,8 +144,7 @@ Commands:
   ACP-compliant agent over stdio.
 - `buzz-agent` — ACP-compliant agent (spawns MCP servers, calls LLMs).
 - `buzz-dev-mcp` — Developer MCP server (shell, str_replace, todo) and
-  multicall entrypoint for `rg`, `tree`, `buzz`, `git-credential-nostr`,
-  `git-sign-nostr`.
+  multicall entrypoint for `rg`, `tree`, `buzz`, `git-credential-nostr`.
 
 See `sprig.json` for SHA-256s, sizes, target, and source git SHA.
 

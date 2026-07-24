@@ -206,7 +206,7 @@ A Rust workspace of focused crates. Single source of truth: the relay. See [ARCH
 
 **Agent surface** — `buzz-cli` (agent-first CLI, JSON in / JSON out) · `buzz-acp` (ACP harness for Goose/Codex/Claude Code) · `buzz-agent` (ACP agent — see [VISION_AGENT.md](VISION_AGENT.md)) · `buzz-dev-mcp` (shell + file-edit tools) · `buzz-workflow` (YAML automation) · `buzz-persona` (agent persona packs)
 
-**Git & pairing** — `git-sign-nostr` / `git-credential-nostr` (nostr-signed git) · `buzz-pair-relay` / `buzz-pairing-cli` (relay pairing)
+**Git & pairing** — `git-credential-nostr` (bearer-authed git) · `buzz-pair-relay` / `buzz-pairing-cli` (relay pairing)
 
 **Shared** — `buzz-sdk` (typed event builders) · `buzz-media` (Blossom/S3)
 

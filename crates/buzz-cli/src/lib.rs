@@ -56,8 +56,10 @@ Buzz CLI — interact with a Buzz relay
 
 Configuration (flags override env vars):
   BUZZ_RELAY_URL     Relay base URL        [default: http://localhost:3000]
-  BUZZ_PRIVATE_KEY   Nostr private key (hex or nsec)  [required]
-  BUZZ_AUTH_TAG      NIP-OA auth tag JSON  [optional]
+  BUZZ_PRIVATE_KEY   Nostr private key (hex or nsec)  [required in nostr mode]
+  BUZZ_AUTH_TAG      NIP-OA auth tag JSON  [optional; nostr mode only]
+  BUZZ_API_KEY       API-key bearer token  [required in apikey mode]
+  BUZZ_AUTH_MODE     Auth doorway: nostr (default) | apikey
 
 The 'pack' subcommand runs locally and does not require a relay connection.
 
@@ -74,8 +76,16 @@ struct Cli {
     private_key: Option<String>,
 
     /// NIP-OA auth tag JSON (owner attestation). Injected into every signed event.
+    /// Ignored in apikey mode (NIP-OA delegation collapses into the key's scopes).
     #[arg(long, env = "BUZZ_AUTH_TAG")]
     auth_tag: Option<String>,
+
+    /// API-key bearer token. When set — or when BUZZ_AUTH_MODE=apikey — the CLI
+    /// authenticates every relay request with `Authorization: Bearer <key>`
+    /// instead of NIP-98 / Blossom signing, and BUZZ_PRIVATE_KEY becomes
+    /// optional (retained only as a local identity for `me`-scoped reads).
+    #[arg(long, env = "BUZZ_API_KEY")]
+    api_key: Option<String>,
 
     /// Output format: 'json' (default, full fields) or 'compact' (reduced fields).
     #[arg(long, value_enum, default_value = "json")]
@@ -1715,27 +1725,70 @@ pub enum ModerationCmd {
     },
 }
 
-async fn run(cli: Cli) -> Result<(), CliError> {
-    let relay_url = client::normalize_relay_url(&cli.relay);
-
-    // Pack commands are local-only — no relay connection needed.
-    if let Cmd::Pack(ref sub) = cli.command {
-        return match sub {
-            PackCmd::Validate { path } => commands::pack::cmd_validate(path),
-            PackCmd::Inspect { path } => commands::pack::cmd_inspect(path),
-        };
+/// Returns `true` if the CLI should use API-key bearer auth (apikey mode).
+///
+/// apikey mode is engaged when a bearer token is present (`--api-key` /
+/// `BUZZ_API_KEY`) or when `BUZZ_AUTH_MODE` names the apikey doorway
+/// (`apikey` / `api_key` / `api-key`, case-insensitive). Otherwise the default
+/// nostr (NIP-42/98) doorway is used.
+fn apikey_mode(api_key: Option<&str>) -> bool {
+    if api_key.is_some() {
+        return true;
     }
+    std::env::var("BUZZ_AUTH_MODE")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "apikey" | "api_key" | "api-key"
+            )
+        })
+        .unwrap_or(false)
+}
 
-    // Auth: private key is required for all relay operations.
-    // The keypair IS the identity — no tokens, no other auth.
-    let private_key_str = cli.private_key.ok_or_else(|| {
+/// Build a [`BuzzClient`] for apikey (bearer) mode.
+///
+/// Requires a bearer token. `BUZZ_PRIVATE_KEY` is optional here: when present it
+/// is retained as the local identity so `me`-scoped read filters resolve to the
+/// caller's actor id (the migration mints one API key per existing actor,
+/// mapping to that actor's pre-existing pubkey); when absent an ephemeral
+/// keypair stands in as a placeholder identity. Either way the relay
+/// authenticates the bearer principal and server-authors written rows.
+fn build_apikey_client(
+    relay_url: String,
+    api_key: Option<String>,
+    private_key: Option<String>,
+) -> Result<BuzzClient, CliError> {
+    let api_key = api_key.ok_or_else(|| {
+        CliError::Auth("apikey mode requires an API key (use --api-key or set BUZZ_API_KEY)".into())
+    })?;
+    let keys = match private_key {
+        Some(ref pk) if !pk.is_empty() => {
+            Keys::parse(pk).map_err(|e| CliError::Key(format!("invalid BUZZ_PRIVATE_KEY: {e}")))?
+        }
+        _ => Keys::generate(),
+    };
+    BuzzClient::new_apikey(relay_url, keys, api_key)
+}
+
+/// Build a [`BuzzClient`] for the default nostr (NIP-42/98) mode.
+///
+/// The keypair IS the identity; `BUZZ_PRIVATE_KEY` is required. An optional
+/// NIP-OA `BUZZ_AUTH_TAG` is parsed and verified against the keypair, then
+/// injected into every signed event.
+fn build_nostr_client(
+    relay_url: String,
+    private_key: Option<String>,
+    auth_tag: Option<String>,
+) -> Result<BuzzClient, CliError> {
+    let private_key_str = private_key.ok_or_else(|| {
         CliError::Auth("BUZZ_PRIVATE_KEY is required (use --private-key or set env var)".into())
     })?;
     let keys = Keys::parse(&private_key_str)
         .map_err(|e| CliError::Key(format!("invalid BUZZ_PRIVATE_KEY: {e}")))?;
 
     // NIP-OA: parse and verify the auth tag if provided.
-    let (auth_tag, auth_tag_json) = match cli.auth_tag {
+    let (auth_tag, auth_tag_json) = match auth_tag {
         Some(ref json) if !json.is_empty() => {
             let tag = buzz_sdk::nip_oa::parse_auth_tag(json)
                 .map_err(|e| CliError::Auth(format!("BUZZ_AUTH_TAG is malformed: {e}")))?;
@@ -1750,7 +1803,28 @@ async fn run(cli: Cli) -> Result<(), CliError> {
         _ => (None, None),
     };
 
-    let client = BuzzClient::new(relay_url, keys, auth_tag, auth_tag_json)?;
+    BuzzClient::new(relay_url, keys, auth_tag, auth_tag_json)
+}
+
+async fn run(cli: Cli) -> Result<(), CliError> {
+    let relay_url = client::normalize_relay_url(&cli.relay);
+
+    // Pack commands are local-only — no relay connection needed.
+    if let Cmd::Pack(ref sub) = cli.command {
+        return match sub {
+            PackCmd::Validate { path } => commands::pack::cmd_validate(path),
+            PackCmd::Inspect { path } => commands::pack::cmd_inspect(path),
+        };
+    }
+
+    // Select the auth doorway. apikey mode is engaged when BUZZ_API_KEY is set
+    // or BUZZ_AUTH_MODE=apikey; otherwise the default nostr (NIP-42/98) path is
+    // used, unchanged.
+    let client = if apikey_mode(cli.api_key.as_deref()) {
+        build_apikey_client(relay_url, cli.api_key, cli.private_key)?
+    } else {
+        build_nostr_client(relay_url, cli.private_key, cli.auth_tag)?
+    };
 
     match cli.command {
         Cmd::Agents(sub) => commands::agents::dispatch(sub, &client).await,
@@ -1786,6 +1860,38 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn apikey_mode_engaged_when_key_present() {
+        // A bearer token forces apikey mode regardless of BUZZ_AUTH_MODE.
+        assert!(super::apikey_mode(Some("some-key")));
+    }
+
+    #[test]
+    fn build_apikey_client_requires_a_key() {
+        match super::build_apikey_client("http://localhost:3000".into(), None, None) {
+            Err(CliError::Auth(_)) => {}
+            _ => panic!("apikey mode without a key must fail with an Auth error"),
+        }
+    }
+
+    #[test]
+    fn build_apikey_client_accepts_key_without_private_key() {
+        // No BUZZ_PRIVATE_KEY: an ephemeral placeholder identity is generated.
+        assert!(
+            super::build_apikey_client("http://localhost:3000".into(), Some("k".into()), None)
+                .is_ok(),
+            "apikey client should build with just a bearer key"
+        );
+    }
+
+    #[test]
+    fn build_nostr_client_requires_private_key() {
+        match super::build_nostr_client("http://localhost:3000".into(), None, None) {
+            Err(CliError::Auth(_)) => {}
+            _ => panic!("nostr mode without a private key must fail with an Auth error"),
+        }
     }
 
     #[test]

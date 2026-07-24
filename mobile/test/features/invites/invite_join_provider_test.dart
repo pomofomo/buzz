@@ -4,7 +4,6 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart' as http_testing;
-import 'package:nostr/nostr.dart' as nostr;
 
 import 'package:buzz/features/invites/invite_join_provider.dart';
 import 'package:buzz/shared/auth/auth.dart';
@@ -12,23 +11,30 @@ import 'package:buzz/shared/deeplink/deep_link.dart';
 
 import '../../shared/community/community_storage_test.dart';
 
+// A plausible relay-issued key + actor, matching the apikey-mode claim contract:
+// {status: "joined", community_id, host, role, api_key: "buzzk_<64hex>",
+//  actor: "<64hex>"}.
+const _issuedActor =
+    '1111111111111111111111111111111111111111111111111111111111111111';
+const _issuedApiKey =
+    'buzzk_2222222222222222222222222222222222222222222222222222222222222222';
+
 void main() {
   for (final existingRelayUrl in [
     'wss://relay.example.com',
     'https://relay.example.com',
   ]) {
     test(
-      'same-relay invite switches existing $existingRelayUrl before keygen or claim',
+      'same-relay invite switches existing $existingRelayUrl before any claim',
       () async {
-        var generatedKeys = 0;
         var claimRequests = 0;
         final storage = CommunityStorage(secure: FakeSecureStorage());
         final existing = Community(
           id: 'existing-id',
           name: 'Existing',
           relayUrl: existingRelayUrl,
-          pubkey: 'old-pubkey',
-          nsec: 'old-nsec',
+          pubkey: 'old-actor',
+          apiKey: 'buzzk_old',
           addedAt: DateTime.utc(2026),
         );
         await storage.save(existing);
@@ -37,10 +43,6 @@ void main() {
           overrides: [
             communityStorageProvider.overrideWithValue(storage),
             authProvider.overrideWith(() => auth),
-            inviteKeyGeneratorProvider.overrideWithValue(() {
-              generatedKeys++;
-              return nostr.Keys.generate();
-            }),
             inviteJoinHttpClientProvider.overrideWithValue(
               http_testing.MockClient((request) async {
                 claimRequests++;
@@ -66,87 +68,161 @@ void main() {
         expect(state.status, InviteJoinStatus.switchedExisting);
         expect(await storage.loadActiveId(), existing.id);
         expect(stored.relayUrl, existingRelayUrl);
-        expect(stored.pubkey, 'old-pubkey');
-        expect(stored.nsec, 'old-nsec');
-        expect(generatedKeys, 0);
+        expect(stored.pubkey, 'old-actor');
+        expect(stored.apiKey, 'buzzk_old');
         expect(claimRequests, 0);
         expect(auth.authenticatedCommunities, isEmpty);
       },
     );
   }
 
-  test(
-    'claim posts with freshly-generated key and stores joined community',
-    () async {
-      final keys = nostr.Keys.generate();
-      http.Request? capturedRequest;
-      final storage = CommunityStorage(secure: FakeSecureStorage());
-      final auth = _RecordingAuthNotifier();
-      final container = ProviderContainer(
-        overrides: [
-          communityStorageProvider.overrideWithValue(storage),
-          authProvider.overrideWith(() => auth),
-          inviteKeyGeneratorProvider.overrideWithValue(() => keys),
-          inviteJoinHttpClientProvider.overrideWithValue(
-            http_testing.MockClient((request) async {
-              capturedRequest = request;
-              return http.Response(
-                jsonEncode({
-                  'status': 'joined',
-                  'community_id': 'community-id',
-                  'host': 'relay.example.com',
-                  'role': 'member',
-                }),
-                200,
-              );
-            }),
+  test('unauthenticated claim stores the relay-issued key + actor', () async {
+    http.Request? capturedRequest;
+    final storage = CommunityStorage(secure: FakeSecureStorage());
+    final auth = _RecordingAuthNotifier();
+    final container = ProviderContainer(
+      overrides: [
+        communityStorageProvider.overrideWithValue(storage),
+        authProvider.overrideWith(() => auth),
+        inviteJoinHttpClientProvider.overrideWithValue(
+          http_testing.MockClient((request) async {
+            capturedRequest = request;
+            return http.Response(
+              jsonEncode({
+                'status': 'joined',
+                'community_id': 'community-uuid',
+                'host': 'relay.example.com',
+                'role': 'member',
+                'api_key': _issuedApiKey,
+                'actor': _issuedActor,
+              }),
+              200,
+            );
+          }),
+        ),
+      ],
+    );
+    addTearDown(container.dispose);
+
+    await container
+        .read(inviteJoinProvider.notifier)
+        .prepare(
+          const InviteDeepLink(
+            relayUrl: 'wss://relay.example.com',
+            code: 'code',
           ),
-        ],
-      );
-      addTearDown(container.dispose);
+        );
+    expect(
+      container.read(inviteJoinProvider).status,
+      InviteJoinStatus.confirming,
+    );
 
-      await container
-          .read(inviteJoinProvider.notifier)
-          .prepare(
-            const InviteDeepLink(
-              relayUrl: 'wss://relay.example.com',
-              code: 'code',
-            ),
-          );
-      expect(
-        container.read(inviteJoinProvider).status,
-        InviteJoinStatus.confirming,
-      );
+    await container.read(inviteJoinProvider.notifier).confirmJoin();
 
-      await container.read(inviteJoinProvider.notifier).confirmJoin();
+    final state = container.read(inviteJoinProvider);
+    expect(state.status, InviteJoinStatus.success);
+    expect(capturedRequest, isNotNull);
+    expect(
+      capturedRequest!.url.toString(),
+      'https://relay.example.com/api/invites/claim',
+    );
+    // The HMAC invite code is the credential — the claim is unauthenticated
+    // and simply posts the code (no bearer / NIP-98 header).
+    expect(capturedRequest!.body, jsonEncode({'code': 'code'}));
+    expect(capturedRequest!.headers.containsKey('Authorization'), isFalse);
 
-      final state = container.read(inviteJoinProvider);
-      expect(state.status, InviteJoinStatus.success);
-      expect(capturedRequest, isNotNull);
-      expect(
-        capturedRequest!.url.toString(),
-        'https://relay.example.com/api/invites/claim',
-      );
-      expect(capturedRequest!.body, jsonEncode({'code': 'code'}));
-      expect(capturedRequest!.headers['Authorization'], startsWith('Nostr '));
-      expect(auth.authenticatedCommunities, hasLength(1));
-      expect(
-        auth.authenticatedCommunities.single.relayUrl,
-        'wss://relay.example.com',
-      );
-      expect(auth.authenticatedCommunities.single.pubkey, keys.public);
-      expect(auth.authenticatedCommunities.single.nsec, keys.nsec);
-    },
-  );
+    expect(auth.authenticatedCommunities, hasLength(1));
+    final joined = auth.authenticatedCommunities.single;
+    expect(joined.relayUrl, 'wss://relay.example.com');
+    expect(joined.pubkey, _issuedActor);
+    expect(joined.apiKey, _issuedApiKey);
+  });
+
+  test('reads api_key/actor fallback field names', () async {
+    final storage = CommunityStorage(secure: FakeSecureStorage());
+    final auth = _RecordingAuthNotifier();
+    final container = ProviderContainer(
+      overrides: [
+        communityStorageProvider.overrideWithValue(storage),
+        authProvider.overrideWith(() => auth),
+        inviteJoinHttpClientProvider.overrideWithValue(
+          http_testing.MockClient((request) async {
+            return http.Response(
+              jsonEncode({
+                'status': 'joined',
+                'host': 'relay.example.com',
+                'role': 'member',
+                // Fallback aliases the client also accepts.
+                'token': _issuedApiKey,
+                'pubkey': _issuedActor,
+              }),
+              200,
+            );
+          }),
+        ),
+      ],
+    );
+    addTearDown(container.dispose);
+
+    await container
+        .read(inviteJoinProvider.notifier)
+        .prepare(
+          const InviteDeepLink(
+            relayUrl: 'wss://relay.example.com',
+            code: 'code',
+          ),
+        );
+    await container.read(inviteJoinProvider.notifier).confirmJoin();
+
+    expect(container.read(inviteJoinProvider).status, InviteJoinStatus.success);
+    final joined = auth.authenticatedCommunities.single;
+    expect(joined.apiKey, _issuedApiKey);
+    expect(joined.pubkey, _issuedActor);
+  });
+
+  test('claim without an API key surfaces an error', () async {
+    final storage = CommunityStorage(secure: FakeSecureStorage());
+    final auth = _RecordingAuthNotifier();
+    final container = ProviderContainer(
+      overrides: [
+        communityStorageProvider.overrideWithValue(storage),
+        authProvider.overrideWith(() => auth),
+        inviteJoinHttpClientProvider.overrideWithValue(
+          http_testing.MockClient((request) async {
+            return http.Response(
+              jsonEncode({
+                'status': 'joined',
+                'host': 'relay.example.com',
+                'role': 'member',
+              }),
+              200,
+            );
+          }),
+        ),
+      ],
+    );
+    addTearDown(container.dispose);
+
+    await container
+        .read(inviteJoinProvider.notifier)
+        .prepare(
+          const InviteDeepLink(
+            relayUrl: 'wss://relay.example.com',
+            code: 'code',
+          ),
+        );
+    await container.read(inviteJoinProvider.notifier).confirmJoin();
+
+    expect(container.read(inviteJoinProvider).status, InviteJoinStatus.error);
+    expect(auth.authenticatedCommunities, isEmpty);
+  });
 
   test('join_policy_required requires a fresh link and cannot retry', () async {
-    final keys = nostr.Keys.generate();
     var attempts = 0;
     final storage = CommunityStorage(secure: FakeSecureStorage());
     final container = ProviderContainer(
       overrides: [
         communityStorageProvider.overrideWithValue(storage),
-        inviteKeyGeneratorProvider.overrideWithValue(() => keys),
         inviteJoinHttpClientProvider.overrideWithValue(
           http_testing.MockClient((request) async {
             attempts++;
@@ -183,62 +259,68 @@ void main() {
     expect(attempts, 1);
   });
 
-  test('failed claim can be retried and preserves policy receipt', () async {
-    final keys = nostr.Keys.generate();
-    var attempts = 0;
-    final bodies = <String>[];
-    final storage = CommunityStorage(secure: FakeSecureStorage());
-    final auth = _RecordingAuthNotifier();
-    final container = ProviderContainer(
-      overrides: [
-        communityStorageProvider.overrideWithValue(storage),
-        authProvider.overrideWith(() => auth),
-        inviteKeyGeneratorProvider.overrideWithValue(() => keys),
-        inviteJoinHttpClientProvider.overrideWithValue(
-          http_testing.MockClient((request) async {
-            attempts++;
-            bodies.add(request.body);
-            if (attempts == 1) {
-              return http.Response(jsonEncode({'error': 'temporary'}), 503);
-            }
-            return http.Response(
-              jsonEncode({
-                'status': 'joined',
-                'host': 'relay.example.com',
-                'role': 'member',
-              }),
-              200,
-            );
-          }),
-        ),
-      ],
-    );
-    addTearDown(container.dispose);
-
-    await container
-        .read(inviteJoinProvider.notifier)
-        .prepare(
-          const InviteDeepLink(
-            relayUrl: 'wss://relay.example.com',
-            code: 'code',
-            policyReceipt: 'receipt.value',
+  test(
+    'failed claim can be retried and preserves the policy receipt',
+    () async {
+      var attempts = 0;
+      final bodies = <String>[];
+      final storage = CommunityStorage(secure: FakeSecureStorage());
+      final auth = _RecordingAuthNotifier();
+      final container = ProviderContainer(
+        overrides: [
+          communityStorageProvider.overrideWithValue(storage),
+          authProvider.overrideWith(() => auth),
+          inviteJoinHttpClientProvider.overrideWithValue(
+            http_testing.MockClient((request) async {
+              attempts++;
+              bodies.add(request.body);
+              if (attempts == 1) {
+                return http.Response(jsonEncode({'error': 'temporary'}), 503);
+              }
+              return http.Response(
+                jsonEncode({
+                  'status': 'joined',
+                  'host': 'relay.example.com',
+                  'role': 'member',
+                  'api_key': _issuedApiKey,
+                  'actor': _issuedActor,
+                }),
+                200,
+              );
+            }),
           ),
-        );
-    await container.read(inviteJoinProvider.notifier).confirmJoin();
-    expect(container.read(inviteJoinProvider).status, InviteJoinStatus.error);
+        ],
+      );
+      addTearDown(container.dispose);
 
-    await container.read(inviteJoinProvider.notifier).confirmJoin();
+      await container
+          .read(inviteJoinProvider.notifier)
+          .prepare(
+            const InviteDeepLink(
+              relayUrl: 'wss://relay.example.com',
+              code: 'code',
+              policyReceipt: 'receipt.value',
+            ),
+          );
+      await container.read(inviteJoinProvider.notifier).confirmJoin();
+      expect(container.read(inviteJoinProvider).status, InviteJoinStatus.error);
 
-    expect(container.read(inviteJoinProvider).status, InviteJoinStatus.success);
-    expect(attempts, 2);
-    expect(
-      bodies,
-      everyElement(
-        jsonEncode({'code': 'code', 'policy_receipt': 'receipt.value'}),
-      ),
-    );
-    expect(auth.authenticatedCommunities, hasLength(1));
-  });
+      await container.read(inviteJoinProvider.notifier).confirmJoin();
+
+      expect(
+        container.read(inviteJoinProvider).status,
+        InviteJoinStatus.success,
+      );
+      expect(attempts, 2);
+      expect(
+        bodies,
+        everyElement(
+          jsonEncode({'code': 'code', 'policy_receipt': 'receipt.value'}),
+        ),
+      );
+      expect(auth.authenticatedCommunities, hasLength(1));
+    },
+  );
 }
 
 class _RecordingAuthNotifier extends AuthNotifier {

@@ -103,9 +103,7 @@ pub async fn handle_req(
             }
         }
     };
-    if let Some(allowed) = token_channel_ids.as_deref() {
-        accessible_channels.retain(|channel_id| allowed.contains(channel_id));
-    }
+    narrow_to_token_channels(&mut accessible_channels, token_channel_ids.as_deref());
 
     let channel_id = extract_channel_id_from_filters(&filters);
 
@@ -983,6 +981,28 @@ fn filter_to_query_params(
         ids,
         e_tags,
         ..EventQuery::for_community(community)
+    }
+}
+
+/// Narrow an accessible-channel set to a bearer / API-key token's per-key
+/// channel restriction, if any.
+///
+/// Membership (`accessible_channels`) stays the *primary* read gate; a token's
+/// `channel_ids` is *additional* narrowing (refactor decision #6) — a key scoped
+/// to channel A can never reach channel B even if its actor is a member of B.
+/// A `None` restriction (an unrestricted token, or `nostr` mode where the WS/HTTP
+/// principal carries no per-key scope) leaves the set unchanged.
+///
+/// Shared by every read gate that resolves an accessible-channel set — WS `REQ`
+/// (`handle_req`), WS `COUNT` (`handlers::count`), and the HTTP bridge
+/// `/query` + `/count` — so the bearer principal's channel narrowing is applied
+/// identically on all read paths.
+pub(crate) fn narrow_to_token_channels(
+    accessible_channels: &mut Vec<uuid::Uuid>,
+    token_channel_ids: Option<&[uuid::Uuid]>,
+) {
+    if let Some(allowed) = token_channel_ids {
+        accessible_channels.retain(|channel_id| allowed.contains(channel_id));
     }
 }
 
@@ -1942,5 +1962,210 @@ mod tests {
         ));
         // No #p tag — fallback required.
         assert!(!result_gated_count_safe_for_pushdown(&f, &owner));
+    }
+}
+
+/// Acceptance tests for Lane D: the seven read gates must hold for the **bearer
+/// principal** (apikey auth mode), not only for a NIP-42/NIP-98 signer.
+///
+/// In apikey mode the authenticated principal is an opaque 32-byte *actor id*
+/// occupying the retained `pubkey` column (decision #2). Every read gate keys on
+/// that authenticated principal — `ctx.pubkey` on WS, the resolved bridge
+/// principal on HTTP — so it *should* function unchanged when the principal is a
+/// bearer actor. These tests pin that: each gate denies a non-authorized bearer
+/// actor and permits the correct one. Server-authored rows (zero sig, stamped
+/// actor) are built with the same [`buzz_core::authoring::author_event_server_side`]
+/// the apikey write path uses, so the tested rows match production apikey rows.
+#[cfg(test)]
+mod bearer_principal_read_gates {
+    use super::*;
+    use nostr::{Alphabet, Filter, SingleLetterTag};
+
+    /// A distinct actor id, agent, owner, and attacker — all as apikey actor ids
+    /// (opaque `PublicKey`s in the retained `pubkey` column).
+    fn actors() -> (nostr::PublicKey, nostr::PublicKey, nostr::PublicKey) {
+        (
+            nostr::Keys::generate().public_key(),
+            nostr::Keys::generate().public_key(),
+            nostr::Keys::generate().public_key(),
+        )
+    }
+
+    /// Build a server-authored (apikey-mode) row: an unsigned intent stamped with
+    /// the actor as author, id recomputed, sig zeroed — exactly what the relay
+    /// stores for a bearer principal.
+    fn server_authored(kind: u16, actor: nostr::PublicKey, tags: Vec<nostr::Tag>) -> nostr::Event {
+        let throwaway = nostr::Keys::generate();
+        let mut ev = nostr::EventBuilder::new(nostr::Kind::Custom(kind), "")
+            .tags(tags)
+            .sign_with_keys(&throwaway)
+            .expect("build intent");
+        buzz_core::authoring::author_event_server_side(&mut ev, actor).expect("author");
+        assert_eq!(ev.pubkey, actor, "server-authored row must carry the actor");
+        assert_eq!(
+            ev.sig.serialize(),
+            [0u8; 64],
+            "server-authored row carries an empty (zero) sig — same row shape as today"
+        );
+        ev
+    }
+
+    // ── Gate 1: channel-membership scoping (via the token channel_ids narrowing
+    //    layered on `accessible_channels`). Membership is the primary gate; a
+    //    per-key `channel_ids` narrows it further for the bearer principal. ──
+
+    #[test]
+    fn channel_gate_token_narrows_bearer_accessible_set() {
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        // Actor is a member of A and B, but the bearer key is scoped to A only.
+        let mut accessible = vec![a, b];
+        narrow_to_token_channels(&mut accessible, Some(&[a]));
+        assert_eq!(accessible, vec![a], "token scoped to A must drop B");
+    }
+
+    #[test]
+    fn channel_gate_unrestricted_token_leaves_membership_untouched() {
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        let mut accessible = vec![a, b];
+        narrow_to_token_channels(&mut accessible, None);
+        assert_eq!(
+            accessible,
+            vec![a, b],
+            "an unrestricted bearer key (or nostr mode) preserves the full membership set"
+        );
+    }
+
+    #[test]
+    fn channel_gate_token_outside_membership_yields_empty() {
+        let a = uuid::Uuid::new_v4();
+        let c = uuid::Uuid::new_v4();
+        // Bearer key names channel C, but the actor is only a member of A.
+        let mut accessible = vec![a];
+        narrow_to_token_channels(&mut accessible, Some(&[c]));
+        assert!(
+            accessible.is_empty(),
+            "a token cannot manufacture access to a channel its actor is not a member of"
+        );
+    }
+
+    // ── Gate 2: p-gate — a bearer actor may only read p-gated kinds addressed to
+    //    itself (#p == actor). ──
+
+    #[test]
+    fn p_gate_denies_bearer_actor_not_in_p_and_permits_the_addressee() {
+        let (actor, other, _) = actors();
+        let actor_hex = actor.to_hex();
+        let p = SingleLetterTag::lowercase(Alphabet::P);
+        let observer = nostr::Kind::Custom(buzz_core::kind::KIND_AGENT_OBSERVER_FRAME as u16);
+
+        // Bearer actor subscribing to a p-gated kind addressed to someone else.
+        let foreign = Filter::new()
+            .kind(observer)
+            .custom_tags(p, [other.to_hex()]);
+        assert!(
+            !p_gated_filters_authorized(&[foreign], &actor_hex),
+            "bearer actor must not read p-gated events addressed to another actor"
+        );
+
+        // Bearer actor subscribing to events addressed to itself.
+        let own = Filter::new()
+            .kind(observer)
+            .custom_tags(p, [actor_hex.clone()]);
+        assert!(
+            p_gated_filters_authorized(&[own], &actor_hex),
+            "bearer actor may read p-gated events addressed to itself"
+        );
+    }
+
+    // ── Gate 3: author-only — a bearer actor may only read author-only kinds it
+    //    authored (both the pre-filter gate and the per-event delivery gate). ──
+
+    #[test]
+    fn author_only_gate_denies_non_author_bearer_actor() {
+        let (actor, other, _) = actors();
+        let reminder = buzz_core::kind::KIND_PUSH_LEASE as u16;
+
+        // Pre-filter gate: a bearer actor querying another actor's author-only
+        // kind (authors=[other]) is rejected up front.
+        let foreign = Filter::new()
+            .kind(nostr::Kind::Custom(reminder))
+            .author(other);
+        assert!(!author_only_filters_authorized(&[foreign], &actor.to_hex()));
+
+        // Per-event delivery gate: a row authored by `other` is omitted for the
+        // bearer actor, but delivered to its author.
+        let row = server_authored(reminder, other, vec![]);
+        assert!(
+            is_author_only_event(&row, &actor.to_bytes()),
+            "author-only row is hidden from a non-author bearer actor"
+        );
+        assert!(
+            !is_author_only_event(&row, &other.to_bytes()),
+            "author-only row is delivered to its authoring bearer actor"
+        );
+    }
+
+    #[test]
+    fn author_only_gate_permits_self_authored_bearer_filter() {
+        let (actor, _, _) = actors();
+        let own = Filter::new()
+            .kind(nostr::Kind::Custom(buzz_core::kind::KIND_PUSH_LEASE as u16))
+            .author(actor);
+        assert!(author_only_filters_authorized(&[own], &actor.to_hex()));
+    }
+
+    // ── Gate 4: result-gated — a bearer actor may only read result-gated rows
+    //    (kind 44200 / 30622) whose #p owner is the actor itself. ──
+
+    #[test]
+    fn result_gated_row_denied_to_non_owner_bearer_actor() {
+        let (agent, owner, attacker) = actors();
+        // An agent-turn-metric row authored by the agent, addressed to the owner.
+        let row = server_authored(
+            buzz_core::kind::KIND_AGENT_TURN_METRIC as u16,
+            agent,
+            vec![nostr::Tag::parse(["p", &owner.to_hex()]).expect("p tag")],
+        );
+
+        assert!(
+            !buzz_core::filter::reader_authorized_for_event(&row, &attacker.to_hex()),
+            "result-gated row must not reach a non-owner bearer actor even via kindless ids"
+        );
+        assert!(
+            buzz_core::filter::reader_authorized_for_event(&row, &owner.to_hex()),
+            "result-gated row is delivered to its #p owner bearer actor"
+        );
+    }
+
+    // ── Gate 5: engram — a bearer actor may only enumerate engrams it authored
+    //    (agent side) or that are addressed to it (#p owner side). ──
+
+    #[test]
+    fn engram_gate_denies_unrelated_bearer_actor_and_permits_owner() {
+        let (agent, owner, attacker) = actors();
+        let p = SingleLetterTag::lowercase(Alphabet::P);
+        let engram = nostr::Kind::Custom(KIND_AGENT_ENGRAM as u16);
+
+        let f = Filter::new()
+            .kind(engram)
+            .author(agent)
+            .custom_tags(p, [owner.to_hex()]);
+        assert!(
+            !engram_filters_authorized(std::slice::from_ref(&f), &attacker.to_hex()),
+            "an unrelated bearer actor cannot enumerate engrams between agent and owner"
+        );
+        assert!(
+            engram_filters_authorized(&[f], &owner.to_hex()),
+            "the owner bearer actor may enumerate engrams addressed to it"
+        );
+
+        // The agent side: querying its own engrams by authors=[self].
+        let agent_side = Filter::new()
+            .kind(engram)
+            .author(agent)
+            .custom_tags(p, [owner.to_hex()]);
+        assert!(engram_filters_authorized(&[agent_side], &agent.to_hex()));
     }
 }

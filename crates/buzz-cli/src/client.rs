@@ -523,9 +523,22 @@ pub struct BuzzClient {
     relay_url: String, // base URL, no trailing slash, e.g. "https://relay.buzz.place"
     keys: Keys,
     /// Optional NIP-OA auth tag injected into every signed event.
+    ///
+    /// Always `None` in apikey mode (NIP-OA delegation collapses into the
+    /// bearer key's stored scopes).
     auth_tag: Option<Tag>,
     /// Raw JSON of the auth tag for the `x-auth-tag` HTTP header.
+    ///
+    /// Always `None` in apikey mode.
     auth_tag_json: Option<String>,
+    /// API-key bearer token (apikey mode).
+    ///
+    /// When `Some`, the client authenticates every HTTP request with
+    /// `Authorization: Bearer <token>` instead of signing a NIP-98 event
+    /// (JSON endpoints) or a Blossom auth event (media), and never sends the
+    /// `x-auth-tag` header. When `None` the client is in nostr mode and uses
+    /// NIP-98 / Blossom signing as before.
+    api_key: Option<String>,
 }
 
 impl BuzzClient {
@@ -555,12 +568,82 @@ impl BuzzClient {
             keys,
             auth_tag,
             auth_tag_json,
+            api_key: None,
+        })
+    }
+
+    /// Create a new client in **apikey mode**, authenticating with a bearer token.
+    ///
+    /// Every HTTP request is authenticated with `Authorization: Bearer <api_key>`
+    /// rather than a per-request NIP-98 / Blossom signature, and no `x-auth-tag`
+    /// header is sent (NIP-OA delegation collapses into the key's stored scopes).
+    /// The `keys` are retained only as the client's local identity placeholder:
+    /// [`sign_event`](Self::sign_event) uses `keys.public_key()` as the unsigned
+    /// intent envelope's `pubkey` (the relay server-authors the row from the
+    /// authenticated actor), and `me`-scoped read filters use it as the actor id.
+    /// Timeouts honour the same `BUZZ_TIMEOUT_SECS` / `BUZZ_CONNECT_TIMEOUT_SECS`
+    /// overrides as [`new`](Self::new).
+    pub fn new_apikey(relay_url: String, keys: Keys, api_key: String) -> Result<Self, CliError> {
+        let http = reqwest::Client::builder()
+            .timeout(env_duration_secs("BUZZ_TIMEOUT_SECS", 30))
+            .connect_timeout(env_duration_secs("BUZZ_CONNECT_TIMEOUT_SECS", 15))
+            .build()
+            .map_err(|e| CliError::Other(e.to_string()))?;
+        Ok(Self {
+            http,
+            relay_url,
+            keys,
+            auth_tag: None,
+            auth_tag_json: None,
+            api_key: Some(api_key),
         })
     }
 
     /// Get the keypair.
     pub fn keys(&self) -> &Keys {
         &self.keys
+    }
+
+    /// The `Authorization` header value for a JSON (`/query`, `/count`, `/events`,
+    /// authed GET) request.
+    ///
+    /// In apikey mode this is the constant bearer header. In nostr mode it signs
+    /// a fresh NIP-98 (kind:27235) event over `method`, `url`, and `body`.
+    fn json_auth_header(
+        &self,
+        method: &str,
+        url: &str,
+        body: Option<&[u8]>,
+    ) -> Result<String, CliError> {
+        match self.api_key {
+            Some(ref key) => Ok(format!("Bearer {key}")),
+            None => sign_nip98(&self.keys, method, url, body),
+        }
+    }
+
+    /// The `Authorization` header value for a Blossom media GET.
+    ///
+    /// Bearer token in apikey mode; a signed BUD-01 `t=get` auth event otherwise.
+    fn media_get_auth_header(&self, media_url: &str) -> Result<String, CliError> {
+        match self.api_key {
+            Some(ref key) => Ok(format!("Bearer {key}")),
+            None => sign_blossom_get(&self.keys, media_url),
+        }
+    }
+
+    /// The `Authorization` header value for a Blossom media upload.
+    ///
+    /// Bearer token in apikey mode; a signed BUD-02 `t=upload` auth event otherwise.
+    fn media_upload_auth_header(
+        &self,
+        sha256: &str,
+        mime: &str,
+        relay_url: &str,
+    ) -> Result<String, CliError> {
+        match self.api_key {
+            Some(ref key) => Ok(format!("Bearer {key}")),
+            None => sign_blossom_upload(&self.keys, sha256, mime, relay_url),
+        }
     }
 
     /// Get the relay base URL.
@@ -585,7 +668,19 @@ impl BuzzClient {
     /// All event creation should go through this method to ensure consistent
     /// auth tag injection. Callers MUST NOT add `auth` tags to the builder
     /// before calling this method.
+    ///
+    /// In **apikey mode** this signs nothing: it builds an unsigned *intent
+    /// envelope* — a [`nostr::Event`] carrying the request `kind`, `tags`,
+    /// `content`, and `created_at`, with a placeholder `pubkey`
+    /// (`self.keys.public_key()`), a content-derived `id`, and an all-zero
+    /// placeholder `sig`. The relay authenticates the bearer principal and
+    /// server-authors the row (stamping the actor and recomputing the id), so
+    /// the envelope's identity fields are advisory only. No NIP-OA auth tag is
+    /// injected in apikey mode.
     pub fn sign_event(&self, builder: EventBuilder) -> Result<nostr::Event, CliError> {
+        if self.api_key.is_some() {
+            return self.build_intent_envelope(builder);
+        }
         let builder = if let Some(ref tag) = self.auth_tag {
             builder.tags([tag.clone()])
         } else {
@@ -610,6 +705,42 @@ impl BuzzClient {
         }
 
         Ok(event)
+    }
+
+    /// Build an unsigned intent envelope from an [`EventBuilder`] (apikey mode).
+    ///
+    /// The relay authenticates the bearer principal and server-authors the row,
+    /// so this method never signs. It builds the request as a [`nostr::Event`]
+    /// whose `kind`, `tags`, `content`, and `created_at` are the caller's request
+    /// and whose identity fields are placeholders:
+    ///
+    /// - `pubkey` — `self.keys.public_key()` (the client's local identity; the
+    ///   relay overwrites it with the authenticated actor).
+    /// - `id` — the NIP-01 content hash over the placeholder pubkey + fields (the
+    ///   relay recomputes it over the server-stamped actor).
+    /// - `sig` — an all-zero placeholder (never verified in apikey mode).
+    ///
+    /// No NIP-OA `auth` tag is injected — delegation collapses into the bearer
+    /// key's stored scopes.
+    fn build_intent_envelope(&self, builder: EventBuilder) -> Result<nostr::Event, CliError> {
+        use nostr::secp256k1::schnorr::Signature;
+
+        let mut unsigned = builder.build(self.keys.public_key());
+        // `id()` computes and caches the NIP-01 content hash.
+        let id = unsigned.id();
+        // `from_slice` only length-checks (64 bytes) — a fixed placeholder cannot
+        // fail, but propagate via `?` to keep the production path unwrap-free.
+        let sig = Signature::from_slice(&[0u8; 64])
+            .map_err(|e| CliError::Other(format!("placeholder signature: {e}")))?;
+        Ok(nostr::Event::new(
+            id,
+            unsigned.pubkey,
+            unsigned.created_at,
+            unsigned.kind,
+            unsigned.tags,
+            unsigned.content,
+            sig,
+        ))
     }
 
     /// Attach the `x-auth-tag` header if configured (NIP-OA relay membership delegation).
@@ -780,7 +911,7 @@ impl BuzzClient {
             let body = body.clone();
             let url = url.clone();
             async move {
-                let auth = sign_nip98(&self.keys, "POST", &url, Some(&body))?;
+                let auth = self.json_auth_header("POST", &url, Some(&body))?;
                 let resp = self
                     .with_auth_tag(
                         self.http
@@ -810,7 +941,7 @@ impl BuzzClient {
             let body = body.clone();
             let url = url.clone();
             async move {
-                let auth = sign_nip98(&self.keys, "POST", &url, Some(&body))?;
+                let auth = self.json_auth_header("POST", &url, Some(&body))?;
                 let resp = self
                     .with_auth_tag(
                         self.http
@@ -838,7 +969,7 @@ impl BuzzClient {
         self.with_retry_body(|| {
             let url = url.clone();
             async move {
-                let auth = sign_nip98(&self.keys, "GET", &url, None)?;
+                let auth = self.json_auth_header("GET", &url, None)?;
                 let resp = self
                     .with_auth_tag(self.http.get(&url).header("Authorization", auth))
                     .send()
@@ -882,7 +1013,7 @@ impl BuzzClient {
 
             // Re-sign NIP-98 each attempt: the nonce tag generates a fresh
             // event ID, keeping retries safe against the relay's replay guard.
-            let auth = sign_nip98(&self.keys, "POST", &url, Some(&body))?;
+            let auth = self.json_auth_header("POST", &url, Some(&body))?;
             let send_result: Result<reqwest::Response, CliError> = self
                 .with_auth_tag(
                     self.http
@@ -1034,7 +1165,7 @@ impl BuzzClient {
                 async move {
                     // Re-sign NIP-98 each attempt: the nonce tag generates a fresh
                     // event ID, keeping retries safe against the relay's replay guard.
-                    let auth = sign_nip98(&self.keys, "POST", &url, Some(&body))?;
+                    let auth = self.json_auth_header("POST", &url, Some(&body))?;
                     let resp = self
                         .with_auth_tag(
                             self.http
@@ -1155,7 +1286,7 @@ impl BuzzClient {
                 let sha256 = sha256.clone();
                 async move {
                     let auth_header =
-                        sign_blossom_upload(&self.keys, &sha256, &mime, &self.relay_url)?;
+                        self.media_upload_auth_header(&sha256, &mime, &self.relay_url)?;
                     let resp = self
                         .with_auth_tag(
                             self.http
@@ -1201,7 +1332,7 @@ impl BuzzClient {
             let mime = mime.clone();
             let sha256 = sha256.clone();
             async move {
-                let auth_header = sign_blossom_upload(&self.keys, &sha256, &mime, &self.relay_url)?;
+                let auth_header = self.media_upload_auth_header(&sha256, &mime, &self.relay_url)?;
                 let resp = self
                     .with_auth_tag(
                         self.http
@@ -1239,7 +1370,7 @@ impl BuzzClient {
             let url = url.clone();
             let client = client.clone();
             async move {
-                let auth_header = sign_blossom_get(&self.keys, &url)?;
+                let auth_header = self.media_get_auth_header(&url)?;
                 let resp = self
                     .with_auth_tag(client.get(&url).header("Authorization", auth_header))
                     .send()
@@ -2473,5 +2604,93 @@ mod tests {
             built.headers().get("x-auth-tag").is_none(),
             "x-auth-tag header must not be present when no auth tag is configured"
         );
+    }
+
+    // ---- apikey (bearer) mode ------------------------------------------------
+
+    fn apikey_client(key: &str) -> BuzzClient {
+        BuzzClient::new_apikey("https://test.relay".into(), Keys::generate(), key.into()).unwrap()
+    }
+
+    #[test]
+    fn apikey_json_auth_header_is_bearer() {
+        let client = apikey_client("secret-key");
+        let header = client
+            .json_auth_header("POST", "https://test.relay/query", Some(b"[]"))
+            .unwrap();
+        assert_eq!(header, "Bearer secret-key");
+    }
+
+    #[test]
+    fn apikey_media_headers_are_bearer() {
+        let client = apikey_client("k");
+        assert_eq!(
+            client
+                .media_get_auth_header("https://test.relay/media/x")
+                .unwrap(),
+            "Bearer k"
+        );
+        assert_eq!(
+            client
+                .media_upload_auth_header("sha", "image/png", "https://test.relay")
+                .unwrap(),
+            "Bearer k"
+        );
+    }
+
+    #[test]
+    fn nostr_json_auth_header_signs_nip98() {
+        let client =
+            BuzzClient::new("https://test.relay".into(), Keys::generate(), None, None).unwrap();
+        let header = client
+            .json_auth_header("POST", "https://test.relay/query", Some(b"[]"))
+            .unwrap();
+        assert!(
+            header.starts_with("Nostr "),
+            "nostr mode must produce a NIP-98 Authorization header, got: {header}"
+        );
+    }
+
+    #[test]
+    fn apikey_client_omits_x_auth_tag_header() {
+        let client = apikey_client("k");
+        let req = client.with_auth_tag(client.http.post("https://test.relay/events"));
+        let built = req.build().unwrap();
+        assert!(
+            built.headers().get("x-auth-tag").is_none(),
+            "apikey mode must never send the x-auth-tag header"
+        );
+    }
+
+    #[test]
+    fn apikey_sign_event_builds_unsigned_intent_envelope() {
+        let keys = Keys::generate();
+        let expected_pk = keys.public_key();
+        let client =
+            BuzzClient::new_apikey("https://test.relay".into(), keys, "secret".into()).unwrap();
+
+        let builder =
+            EventBuilder::new(Kind::Custom(9), "hello")
+                .tags([Tag::parse(["h", "channel-uuid"]).unwrap()]);
+        let event = client.sign_event(builder).unwrap();
+
+        // Placeholder pubkey is the client's local identity; the relay overwrites it.
+        assert_eq!(event.pubkey, expected_pk);
+        // All-zero placeholder signature — never verified in apikey mode.
+        assert_eq!(event.sig.serialize(), [0u8; 64]);
+        // Request fields preserved.
+        assert_eq!(event.content, "hello");
+        assert_eq!(event.kind, Kind::Custom(9));
+        assert!(event
+            .tags
+            .iter()
+            .any(|t| t.as_slice() == ["h", "channel-uuid"]));
+        // Real 32-byte NIP-01 content-hash id (column-shape stable).
+        assert_eq!(event.id.as_bytes().len(), 32);
+        // No NIP-OA auth tag is injected in apikey mode.
+        assert!(!event
+            .tags
+            .iter()
+            .any(|t| t.as_slice().first().map(String::as_str) == Some("auth")));
     }
 }

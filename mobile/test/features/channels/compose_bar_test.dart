@@ -11,7 +11,6 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart' as http_testing;
 import 'package:image_picker/image_picker.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
-import 'package:nostr/nostr.dart' as nostr;
 import 'package:buzz/features/channels/channel.dart';
 import 'package:buzz/features/channels/channel_management_provider.dart';
 import 'package:buzz/features/channels/compose_bar.dart';
@@ -101,6 +100,11 @@ final _apngBytes = Uint8List.fromList([
   0x00,
 ]);
 
+// Fixed actor id (formerly the signed-in user's Nostr pubkey) used where the
+// compose bar needs the current principal's id.
+const _kActor =
+    'cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc';
+
 const _mediaUploadPlatformChannel = MethodChannel('buzz/media_upload');
 
 void _setMockMediaUploadPlatformHandler(
@@ -157,10 +161,8 @@ Widget _buildComposeBar({
 
 class _FakeRelayConfigNotifier extends RelayConfigNotifier {
   @override
-  RelayConfig build() => RelayConfig(
-    baseUrl: 'http://localhost:3000',
-    nsec: nostr.Keys.generate().nsec,
-  );
+  RelayConfig build() =>
+      RelayConfig(baseUrl: 'http://localhost:3000', apiKey: 'buzzk_test');
 }
 
 class _RecordingRelaySocket extends RelaySocket {
@@ -170,7 +172,7 @@ class _RecordingRelaySocket extends RelaySocket {
   _RecordingRelaySocket(this.events, this.handleMessage)
     : super(
         wsUrl: 'ws://localhost',
-        nsec: null,
+        apiKey: null,
         onMessage: handleMessage,
         onConnected: () {},
         onDisconnected: (_) {},
@@ -236,11 +238,9 @@ void main() {
     testWidgets('uploads an image and sends markdown plus imeta tags', (
       tester,
     ) async {
-      final keychain = nostr.Keys.generate();
-      final nsec = keychain.nsec;
       final uploadService = MediaUploadService(
         baseUrl: 'https://relay.example',
-        nsec: nsec,
+        apiKey: 'buzzk_test',
         httpClient: http_testing.MockClient((request) async {
           return http.Response(
             jsonEncode({
@@ -301,13 +301,12 @@ void main() {
     testWidgets('pasted image follows the attachment preview and send path', (
       tester,
     ) async {
-      final keychain = nostr.Keys.generate();
       var galleryPickerCalled = false;
       Uint8List? uploadedBytes;
       String? uploadedMimeType;
       final uploadService = MediaUploadService(
         baseUrl: 'https://relay.example',
-        nsec: keychain.nsec,
+        apiKey: 'buzzk_test',
         httpClient: http_testing.MockClient((request) async {
           uploadedBytes = request.bodyBytes;
           uploadedMimeType = request.headers['Content-Type'];
@@ -397,7 +396,7 @@ void main() {
       try {
         final uploadService = MediaUploadService(
           baseUrl: 'https://relay.example',
-          nsec: nostr.Keys.generate().nsec,
+          apiKey: 'buzzk_test',
           httpClient: http_testing.MockClient(
             (request) async => http.Response(
               jsonEncode({
@@ -473,7 +472,7 @@ void main() {
       try {
         final uploadService = MediaUploadService(
           baseUrl: 'https://relay.example',
-          nsec: nostr.Keys.generate().nsec,
+          apiKey: 'buzzk_test',
           pickGalleryVideo: () async => null,
           pickGalleryImage: () async => null,
         );
@@ -529,7 +528,7 @@ void main() {
       try {
         final uploadService = MediaUploadService(
           baseUrl: 'https://relay.example',
-          nsec: nostr.Keys.generate().nsec,
+          apiKey: 'buzzk_test',
           httpClient: http_testing.MockClient(
             (request) async => http.Response(
               jsonEncode({
@@ -593,7 +592,7 @@ void main() {
     ) async {
       final uploadService = MediaUploadService(
         baseUrl: 'https://relay.example',
-        nsec: nostr.Keys.generate().nsec,
+        apiKey: 'buzzk_test',
         pickGalleryVideo: () async => null,
         pickGalleryImage: () async => null,
       );
@@ -630,7 +629,7 @@ void main() {
       try {
         final uploadService = MediaUploadService(
           baseUrl: 'https://relay.example',
-          nsec: nostr.Keys.generate().nsec,
+          apiKey: 'buzzk_test',
           pickGalleryVideo: () async => null,
           pickGalleryImage: () async => null,
           readClipboardImage: () async => null,
@@ -674,7 +673,7 @@ void main() {
     ) async {
       final uploadService = MediaUploadService(
         baseUrl: 'https://relay.example',
-        nsec: nostr.Keys.generate().nsec,
+        apiKey: 'buzzk_test',
         pickGalleryVideo: () async => null,
         pickGalleryImage: () async => null,
       );
@@ -710,11 +709,9 @@ void main() {
     testWidgets('keeps the remove button pinned to the attachment corner', (
       tester,
     ) async {
-      final keychain = nostr.Keys.generate();
-      final nsec = keychain.nsec;
       final uploadService = MediaUploadService(
         baseUrl: 'https://relay.example',
-        nsec: nsec,
+        apiKey: 'buzzk_test',
         httpClient: http_testing.MockClient((request) async {
           return http.Response(
             jsonEncode({
@@ -777,11 +774,9 @@ void main() {
     testWidgets('shows an upload error when gallery upload fails', (
       tester,
     ) async {
-      final keychain = nostr.Keys.generate();
-      final nsec = keychain.nsec;
       final uploadService = MediaUploadService(
         baseUrl: 'https://relay.example',
-        nsec: nsec,
+        apiKey: 'buzzk_test',
         httpClient: http_testing.MockClient((request) async {
           return http.Response('bad upload', 401);
         }),
@@ -817,10 +812,9 @@ void main() {
       testWidgets('shows friendly copy for a $statusCode upload response', (
         tester,
       ) async {
-        final keychain = nostr.Keys.generate();
         final uploadService = MediaUploadService(
           baseUrl: 'https://relay.example',
-          nsec: keychain.nsec,
+          apiKey: 'buzzk_test',
           httpClient: http_testing.MockClient(
             (request) async => http.Response(
               '{"error":"media contains metadata or a non-canonical metadata channel"}',
@@ -859,11 +853,9 @@ void main() {
     }
 
     testWidgets('shows a clean error when a GIF is picked', (tester) async {
-      final keychain = nostr.Keys.generate();
-      final nsec = keychain.nsec;
       final uploadService = MediaUploadService(
         baseUrl: 'https://relay.example',
-        nsec: nsec,
+        apiKey: 'buzzk_test',
         pickGalleryVideo: () async => null,
         pickGalleryImage: () async =>
             XFile.fromData(_gifBytes, name: 'animated.gif'),
@@ -896,11 +888,10 @@ void main() {
       tester,
     ) async {
       final agentPubkey = 'c' * 64;
-      final signer = nostr.Keys.generate();
       final publishedEvents = <Map<String, dynamic>>[];
       final uploadService = MediaUploadService(
         baseUrl: 'https://relay.example',
-        nsec: signer.nsec,
+        apiKey: 'buzzk_test',
         pickGalleryImage: () async => null,
         pickGalleryVideo: () async => null,
       );
@@ -910,7 +901,7 @@ void main() {
       await tester.pumpWidget(
         _buildComposeBar(
           uploadService: uploadService,
-          currentPubkey: signer.public,
+          currentPubkey: _kActor,
           relayAgents: [
             AgentDirectoryEntry(
               pubkey: agentPubkey,
@@ -966,14 +957,13 @@ void main() {
       tester,
     ) async {
       final agentPubkey = 'd' * 64;
-      final signer = nostr.Keys.generate();
       final publishedEvents = <Map<String, dynamic>>[];
       String? sentContent;
 
       await tester.pumpWidget(
         _buildComposeBar(
-          uploadService: _testUploadService(signer.nsec),
-          currentPubkey: signer.public,
+          uploadService: _testUploadService(),
+          currentPubkey: _kActor,
           relayAgents: [_testAgent(agentPubkey)],
           channels: [
             _makeCurrentChannel(channelType: 'dm'),
@@ -1010,15 +1000,14 @@ void main() {
       tester,
     ) async {
       final agentPubkey = 'e' * 64;
-      final signer = nostr.Keys.generate();
       final membersCompleter = Completer<List<ChannelMember>>();
       final publishedEvents = <Map<String, dynamic>>[];
       var didSend = false;
 
       await tester.pumpWidget(
         _buildComposeBar(
-          uploadService: _testUploadService(signer.nsec),
-          currentPubkey: signer.public,
+          uploadService: _testUploadService(),
+          currentPubkey: _kActor,
           membersFuture: membersCompleter.future,
           relayAgents: [_testAgent(agentPubkey)],
           channels: [_makeCurrentChannel(), _makeSharedMemberChannel()],
@@ -1070,11 +1059,9 @@ void main() {
     testWidgets('shows a clean error when an animated PNG is picked', (
       tester,
     ) async {
-      final keychain = nostr.Keys.generate();
-      final nsec = keychain.nsec;
       final uploadService = MediaUploadService(
         baseUrl: 'https://relay.example',
-        nsec: nsec,
+        apiKey: 'buzzk_test',
         pickGalleryVideo: () async => null,
         pickGalleryImage: () async =>
             XFile.fromData(_apngBytes, name: 'animated.png'),
@@ -1108,9 +1095,6 @@ void main() {
     testWidgets('taps Video in chooser sheet and uploads video', skip: true, (
       tester,
     ) async {
-      final keychain = nostr.Keys.generate();
-      final nsec = keychain.nsec;
-
       // Build a temp file with a valid MP4 ftyp header (isom brand).
       final mp4Bytes = Uint8List(32);
       mp4Bytes[3] = 32;
@@ -1129,7 +1113,7 @@ void main() {
       try {
         final uploadService = MediaUploadService(
           baseUrl: 'https://relay.example',
-          nsec: nsec,
+          apiKey: 'buzzk_test',
           httpClient: http_testing.MockClient((request) async {
             return http.Response(
               jsonEncode({
@@ -1382,10 +1366,10 @@ void main() {
   });
 }
 
-MediaUploadService _testUploadService(String nsec) {
+MediaUploadService _testUploadService() {
   return MediaUploadService(
     baseUrl: 'https://relay.example',
-    nsec: nsec,
+    apiKey: 'buzzk_test',
     pickGalleryImage: () async => null,
     pickGalleryVideo: () async => null,
   );

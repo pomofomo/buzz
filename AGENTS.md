@@ -6,6 +6,45 @@ code style, PR process, architecture), see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
+## ⚠️ Active migration: Nostr substrate → API-key auth
+
+Buzz is mid-migration from a Nostr identity/transport/record model to
+**API-key bearer auth + server-authored records**, while preserving the Postgres
+schema and query API. This is **flag-gated** and additive:
+
+- `BUZZ_AUTH_MODE=nostr` (**default**) — original NIP-42 (WS) / NIP-98 (HTTP)
+  signature auth. Everything in this guide below still applies.
+- `BUZZ_AUTH_MODE=apikey` — identity is a per-actor **API key** (stored hashed in
+  `api_tokens`, with a scope set). Clients present `Authorization: Bearer <token>`
+  on the WebSocket **upgrade** request and on HTTP bridge calls; the **server
+  authors** each row after the auth gate (clients send an *unsigned* intent
+  envelope — kind/tags/content — and the relay stamps the actor, computes the
+  NIP-01 id, and leaves `sig` empty/nullable). Authorization = API-key **scopes**
+  (`crates/buzz-auth/src/scope.rs`) + existing channel membership. Device pairing
+  (NIP-AB) and `git-sign-nostr` are removed; git auth and `git-credential-nostr`
+  use bearer tokens; Blossom media auth uses bearer.
+
+Keys are issued/revoked via `buzz-admin issue-key|revoke-key|list-keys|rotate-key`.
+
+**When touching auth/identity/ingest/read/media/git code, keep BOTH modes
+working** (nostr default unchanged; apikey path added) unless a task says
+otherwise. The read authorization gates (channel membership + p-gate /
+author-only / result-gated / engram) are load-bearing in **both** modes — never
+weaken them.
+
+**Migration docs:**
+- [REFACTOR.md](REFACTOR.md) — design, locked decisions, per-lane plan.
+- [GREEN_GATE.md](GREEN_GATE.md) — the "is the tree green?" checklist.
+- [FULL_TESTS.md](FULL_TESTS.md) — setup + remaining steps to finish/verify in a
+  full environment (mobile Flutter, desktop Playwright, Postgres/Redis
+  integration suite, E2E-encryption removal, audit-test review).
+
+Client-side E2E encryption (NIP-44/NIP-17) is being **dropped** in the apikey
+model (trust-the-server); some desktop/web removal is still pending (see
+FULL_TESTS.md §5.E).
+
+---
+
 ## Ecosystem
 
 Buzz spans five repos. This one (`block/buzz`) is the OSS source for the relay, desktop, mobile, and CLI. The others handle internal builds and deployment:
@@ -54,8 +93,7 @@ crates/
   # Clients + interop
   buzz-pair-relay     # Ephemeral sidecar relay for NIP-AB device pairing
   buzz-pairing-cli    # CLI for NIP-AB device pairing interop testing
-  git-sign-nostr      # Sign git objects with a Nostr key
-  git-credential-nostr # Git credential helper for Nostr-authed push/fetch
+  git-credential-nostr # Git credential helper for bearer-authed push/fetch
   # Tooling + shared
   buzz-cli            # Agent-first CLI
   buzz-sdk            # Typed Nostr event builders

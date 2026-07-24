@@ -24,11 +24,58 @@ use axum::{
 use serde::Deserialize;
 use serde_json::Value;
 
+use buzz_auth::Scope;
+use sha2::{Digest, Sha256};
+
 use crate::handlers::side_effects::{publish_nip43_member_added, publish_nip43_membership_list};
 use crate::invite_token::{self, DEFAULT_INVITE_TTL_SECS};
 use crate::state::AppState;
 
 use super::{api_error, bridge, internal_error};
+
+/// Human-readable prefix on every self-minted member token.
+///
+/// Matches `buzz-admin`'s operator-issued key prefix (`buzzk_`) so a leaked
+/// Buzz key is recognisable to the same secret-scanners regardless of whether
+/// an operator issued it or a member self-minted it by claiming an invite. It
+/// is part of the string whose SHA-256 is stored, so the client must reproduce
+/// it verbatim as the `Authorization: Bearer` credential.
+const MEMBER_TOKEN_PREFIX: &str = "buzzk_";
+
+/// Number of random bytes in the secret body of a self-minted token
+/// (256 bits of entropy), matching `buzz-admin`'s `TOKEN_RANDOM_BYTES`.
+const MEMBER_TOKEN_RANDOM_BYTES: usize = 32;
+
+/// Default scope set granted to a member who joins by claiming an invite
+/// (`apikey` mode). Grounded in [`crate::handlers::ingest::required_scope_for_kind`]:
+/// this is exactly the set an ordinary member needs, and deliberately excludes
+/// every admin/elevated scope.
+///
+/// - `messages:read` — the read gate (`handlers::req` / bridge `enforce_read_scope`).
+/// - `messages:write` — send messages, replies, reactions, deletions, edits, DMs
+///   (`KIND_TEXT_NOTE`, `KIND_STREAM_MESSAGE*`, `KIND_REACTION`, `KIND_DELETION`, …).
+/// - `channels:read` — list channel metadata and join/leave channels
+///   (`KIND_NIP29_JOIN_REQUEST`/`KIND_NIP29_LEAVE_REQUEST` → `ChannelsRead`).
+/// - `users:read` — read other members' profiles (people directory).
+/// - `users:write` — own profile (`KIND_PROFILE`), read-state
+///   (`KIND_READ_STATE`), status, contact/mute/pin lists — all core member ops
+///   gated on `UsersWrite`.
+/// - `files:read` / `files:write` — download and upload attachments (Blossom media).
+/// - `subscriptions:read` — read plan/subscription information.
+///
+/// Excluded on purpose: `channels:write` (channel create/edit is an elevated
+/// action, not an ordinary-member op), `admin:*`, `repos:*`, `jobs:*`, and
+/// `subscriptions:write`.
+const MEMBER_SELF_MINT_SCOPES: [Scope; 8] = [
+    Scope::MessagesRead,
+    Scope::MessagesWrite,
+    Scope::ChannelsRead,
+    Scope::UsersRead,
+    Scope::UsersWrite,
+    Scope::FilesRead,
+    Scope::FilesWrite,
+    Scope::SubscriptionsRead,
+];
 
 /// Fixed-window size for the per-pubkey claim rate limiter.
 pub(crate) const CLAIM_RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -188,6 +235,29 @@ pub async fn accept_policy(
     Ok(Json(serde_json::json!({ "receipt": receipt })))
 }
 
+/// Bind the tenant community from the request `Host` header (row zero).
+///
+/// Shared by both the NIP-98 ([`authenticate`]) and the `apikey`-mode bearer
+/// doorways. An unmapped host fails closed with a generic 404 — never a default
+/// tenant, never echoing the host.
+async fn bind_tenant(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+) -> Result<buzz_core::TenantContext, (StatusCode, Json<Value>)> {
+    let raw_host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    crate::tenant::bind_community(&state.db, raw_host)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "relay: no community is configured for this host",
+            )
+        })
+}
+
 /// Shared prelude: bind the tenant from the Host header and verify the NIP-98
 /// signature + replay for `path`.
 async fn authenticate(
@@ -196,18 +266,7 @@ async fn authenticate(
     path: &str,
     body: &[u8],
 ) -> Result<(buzz_core::TenantContext, nostr::PublicKey), (StatusCode, Json<Value>)> {
-    let raw_host = headers
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let tenant = crate::tenant::bind_community(&state.db, raw_host)
-        .await
-        .map_err(|_| {
-            api_error(
-                StatusCode::NOT_FOUND,
-                "relay: no community is configured for this host",
-            )
-        })?;
+    let tenant = bind_tenant(state, headers).await?;
 
     let url = bridge::nip98_expected_url(&state.config.relay_url, &tenant, path);
     let (pubkey, event_id_bytes) = bridge::verify_bridge_auth_with_options(
@@ -223,7 +282,15 @@ async fn authenticate(
     Ok((tenant, pubkey))
 }
 
-/// Mint an invite code — `POST /api/invites`, NIP-98 signed by an owner/admin.
+/// Mint an invite code — `POST /api/invites`.
+///
+/// Authorization mirrors kind:9030 (add member): an owner/admin only.
+///
+/// - **nostr mode:** NIP-98 signed by an owner/admin (relay-member role check).
+/// - **apikey mode:** `Authorization: Bearer <token>` whose key holds the
+///   `admin:users` scope — the same scope `required_scope_for_kind` requires for
+///   the kind:9030 relay-admin add-member command, so minting an invite (which
+///   authorizes a future member add) demands the identical grant.
 ///
 /// Returns the code, its expiry, and a shareable landing-page URL on the
 /// tenant host.
@@ -232,22 +299,27 @@ pub async fn mint_invite(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let (tenant, pubkey) = authenticate(&state, &headers, "/api/invites", &body).await?;
+    let (tenant, sender_hex) = if state.auth.auth_mode().is_apikey() {
+        mint_authenticate_apikey(&state, &headers).await?
+    } else {
+        let (tenant, pubkey) = authenticate(&state, &headers, "/api/invites", &body).await?;
 
-    // Authz mirrors kind:9030 (add member): owner or admin only.
-    let sender_hex = pubkey.to_hex();
-    let member = state
-        .db
-        .get_relay_member(tenant.community(), &sender_hex)
-        .await
-        .map_err(|e| internal_error(&format!("invite mint role lookup: {e}")))?;
-    let role = member.map(|m| m.role).unwrap_or_default();
-    if role != "owner" && role != "admin" {
-        return Err(api_error(
-            StatusCode::FORBIDDEN,
-            "only relay owners and admins can create invites",
-        ));
-    }
+        // Authz mirrors kind:9030 (add member): owner or admin only.
+        let sender_hex = pubkey.to_hex();
+        let member = state
+            .db
+            .get_relay_member(tenant.community(), &sender_hex)
+            .await
+            .map_err(|e| internal_error(&format!("invite mint role lookup: {e}")))?;
+        let role = member.map(|m| m.role).unwrap_or_default();
+        if role != "owner" && role != "admin" {
+            return Err(api_error(
+                StatusCode::FORBIDDEN,
+                "only relay owners and admins can create invites",
+            ));
+        }
+        (tenant, sender_hex)
+    };
 
     let request: MintInviteRequest = if body.is_empty() {
         MintInviteRequest::default()
@@ -286,13 +358,70 @@ pub async fn mint_invite(
     })))
 }
 
-/// Claim an invite code — `POST /api/invites/claim`, NIP-98 signed by the
-/// *joining* pubkey. Exempt from the relay-membership gate by design.
+/// Authenticate an `apikey`-mode mint request via `Authorization: Bearer`.
+///
+/// Binds the tenant, verifies the bearer token against the community-scoped
+/// `api_tokens` store, and requires the [`Scope::AdminUsers`] scope — the same
+/// grant `required_scope_for_kind` demands for the kind:9030 relay-admin
+/// add-member command. Returns the tenant and the authenticated actor's hex id
+/// (for the audit log line), mirroring the nostr path's `(tenant, sender_hex)`.
+async fn mint_authenticate_apikey(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+) -> Result<(buzz_core::TenantContext, String), (StatusCode, Json<Value>)> {
+    let tenant = bind_tenant(state, headers).await?;
+    let token = bearer_token(headers)?;
+    let ctx = state
+        .auth
+        .verify_api_key(token, tenant.community(), &state.db)
+        .await
+        .map_err(|_| api_error(StatusCode::UNAUTHORIZED, "invalid bearer token"))?;
+    if !ctx.has_scope(&Scope::AdminUsers) {
+        return Err(api_error(
+            StatusCode::FORBIDDEN,
+            "only relay owners and admins can create invites",
+        ));
+    }
+    Ok((tenant, ctx.pubkey.to_hex()))
+}
+
+/// Extract a non-empty `Authorization: Bearer <token>` value, or 401.
+fn bearer_token(headers: &HeaderMap) -> Result<&str, (StatusCode, Json<Value>)> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            api_error(
+                StatusCode::UNAUTHORIZED,
+                "missing Authorization: Bearer token",
+            )
+        })
+}
+
+/// Claim an invite code — `POST /api/invites/claim`. Exempt from the
+/// relay-membership gate by design: the whole point is that the caller is not a
+/// member yet, and the HMAC on the code is what proves an admin authorized the
+/// join.
+///
+/// - **nostr mode:** NIP-98 signed by the *joining* pubkey; the relay records
+///   that pubkey as a member and returns `{status, community_id, host, role}`.
+/// - **apikey mode:** unauthenticated — the invite code in the body *is* the
+///   credential. The joiner has no identity yet, so the relay mints a fresh
+///   random actor id, self-mints an API key for it
+///   ([`MEMBER_SELF_MINT_SCOPES`]), records the membership, and returns the
+///   plaintext `api_key` and `actor` alongside the existing fields.
 pub async fn claim_invite(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if state.auth.auth_mode().is_apikey() {
+        return claim_invite_apikey(&state, &headers, &body).await;
+    }
+
     let (tenant, pubkey) = authenticate(&state, &headers, "/api/invites/claim", &body).await?;
 
     if claim_rate_limited(&state, tenant.community(), &pubkey) {
@@ -306,54 +435,15 @@ pub async fn claim_invite(
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid claim JSON: {e}")))?;
 
     let key = invite_token::derive_invite_key(&state.relay_keypair);
-    let payload = invite_token::verify_invite(&key, tenant.community(), &request.code).map_err(
-        |e| match e {
-            // Expired is post-MAC: revealing it helps the UX without helping a forger.
-            invite_token::InviteError::Expired => {
-                api_error(StatusCode::FORBIDDEN, "invite_expired")
-            }
-            // Everything else stays coarse so the endpoint is a poor oracle.
-            _ => api_error(StatusCode::FORBIDDEN, "invite_invalid"),
-        },
-    )?;
+    let payload = verify_claim_code(&key, tenant.community(), &request.code)?;
+
+    verify_claim_policy(&state, &key, &request)?;
 
     let claimer_hex = pubkey.to_hex();
-    if let Some(policy) = &state.config.join_policy {
-        let receipt = request
-            .policy_receipt
-            .as_deref()
-            .ok_or_else(|| api_error(StatusCode::FORBIDDEN, "join_policy_required"))?;
-        invite_token::verify_policy_acceptance(&key, receipt, &request.code, &policy.version)
-            .map_err(|_| api_error(StatusCode::FORBIDDEN, "join_policy_required"))?;
-    }
-
-    let was_inserted = state
-        .db
-        .claim_relay_membership(
-            tenant.community(),
-            &claimer_hex,
-            &payload.r,
-            state
-                .config
-                .join_policy
-                .as_ref()
-                .map(|policy| policy.version.as_str()),
-        )
-        .await
-        .map_err(|e| internal_error(&format!("invite claim insert: {e}")))?;
+    let was_inserted = insert_claim_membership(&state, &tenant, &claimer_hex, &payload.r).await?;
 
     if was_inserted {
-        tracing::info!(
-            community = %tenant.community(),
-            member = %claimer_hex,
-            "relay member added via invite"
-        );
-        if let Err(e) = publish_nip43_member_added(&tenant, &state, &claimer_hex).await {
-            tracing::warn!("failed to publish NIP-43 member-added delta after claim: {e}");
-        }
-        if let Err(e) = publish_nip43_membership_list(&tenant, &state).await {
-            tracing::warn!("failed to publish NIP-43 membership list after claim: {e}");
-        }
+        announce_member_added(&state, &tenant, &claimer_hex).await;
     }
 
     Ok(Json(serde_json::json!({
@@ -362,6 +452,184 @@ pub async fn claim_invite(
         "host": tenant.host(),
         "role": payload.r,
     })))
+}
+
+/// `apikey`-mode claim: no bearer required — the HMAC invite code is the
+/// credential. On a valid claim the relay mints a fresh actor id, self-mints an
+/// API key for it, records the membership, and returns the plaintext key.
+///
+/// Every claim mints a *new* actor+key: an invite link opened on a new device is
+/// a new identity, so the response is always `"joined"` (never `"already_member"`).
+/// The rate limiter is re-keyed from the (absent) pubkey to the invite code hash,
+/// bounding how fast one code can spend itself into fresh keys.
+async fn claim_invite_apikey(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let tenant = bind_tenant(state, headers).await?;
+
+    let request: ClaimInviteRequest = serde_json::from_slice(body)
+        .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid claim JSON: {e}")))?;
+
+    // Re-key the limiter from pubkey to the invite-code hash for the
+    // unauthenticated path: a valid claim mints a key+actor, so the throttle is
+    // per-credential-spend. Runs after parse (the code is needed to key it) but
+    // before any MAC work or minting.
+    if claim_rate_limited_by_code(state, tenant.community(), &request.code) {
+        return Err(api_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many invite claim attempts, slow down",
+        ));
+    }
+
+    let key = invite_token::derive_invite_key(&state.relay_keypair);
+    let payload = verify_claim_code(&key, tenant.community(), &request.code)?;
+
+    verify_claim_policy(state, &key, &request)?;
+
+    // The joiner has no identity yet — mint a fresh random 32-byte actor id.
+    let actor_bytes: [u8; 32] = rand::random();
+    let actor_hex = hex::encode(actor_bytes);
+
+    // The `api_tokens.owner_pubkey` column is foreign-keyed to `users`; the
+    // actor must exist as a user row before its key can be stored.
+    state
+        .db
+        .ensure_user(tenant.community(), &actor_bytes)
+        .await
+        .map_err(|e| internal_error(&format!("invite claim ensure user: {e}")))?;
+
+    let was_inserted = insert_claim_membership(state, &tenant, &actor_hex, &payload.r).await?;
+
+    // Self-mint the member's API key (created_by_self_mint = true). The fresh
+    // actor has no prior tokens, so the per-owner limit can never bite here.
+    let (token, token_hash) = generate_member_token();
+    let scopes: Vec<String> = MEMBER_SELF_MINT_SCOPES
+        .iter()
+        .map(|s| s.as_str().to_string())
+        .collect();
+    let minted = state
+        .db
+        .create_api_token_if_under_limit(
+            tenant.community(),
+            &token_hash,
+            &actor_bytes,
+            &format!("invite-member-{actor_hex}"),
+            &scopes,
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| internal_error(&format!("invite claim key mint: {e}")))?;
+    if minted.is_none() {
+        return Err(internal_error("invite claim key mint: token limit reached"));
+    }
+
+    if was_inserted {
+        announce_member_added(state, &tenant, &actor_hex).await;
+    }
+
+    Ok(Json(serde_json::json!({
+        "status": if was_inserted { "joined" } else { "already_member" },
+        "community_id": tenant.community().to_string(),
+        "host": tenant.host(),
+        "role": payload.r,
+        "api_key": token,
+        "actor": actor_hex,
+    })))
+}
+
+/// Verify the invite code's HMAC (and non-expiry), mapping token errors to the
+/// coarse `invite_invalid` / distinguishable `invite_expired` bodies.
+fn verify_claim_code(
+    key: &[u8; 32],
+    community: buzz_core::CommunityId,
+    code: &str,
+) -> Result<invite_token::InvitePayload, (StatusCode, Json<Value>)> {
+    invite_token::verify_invite(key, community, code).map_err(|e| match e {
+        // Expired is post-MAC: revealing it helps the UX without helping a forger.
+        invite_token::InviteError::Expired => api_error(StatusCode::FORBIDDEN, "invite_expired"),
+        // Everything else stays coarse so the endpoint is a poor oracle.
+        _ => api_error(StatusCode::FORBIDDEN, "invite_invalid"),
+    })
+}
+
+/// Enforce the configured join policy receipt, if any, for a claim.
+fn verify_claim_policy(
+    state: &AppState,
+    key: &[u8; 32],
+    request: &ClaimInviteRequest,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    if let Some(policy) = &state.config.join_policy {
+        let receipt = request
+            .policy_receipt
+            .as_deref()
+            .ok_or_else(|| api_error(StatusCode::FORBIDDEN, "join_policy_required"))?;
+        invite_token::verify_policy_acceptance(key, receipt, &request.code, &policy.version)
+            .map_err(|_| api_error(StatusCode::FORBIDDEN, "join_policy_required"))?;
+    }
+    Ok(())
+}
+
+/// Insert relay membership for `member_hex` under the claimed `role`, recording
+/// the configured join-policy version in the same transaction.
+async fn insert_claim_membership(
+    state: &AppState,
+    tenant: &buzz_core::TenantContext,
+    member_hex: &str,
+    role: &str,
+) -> Result<bool, (StatusCode, Json<Value>)> {
+    state
+        .db
+        .claim_relay_membership(
+            tenant.community(),
+            member_hex,
+            role,
+            state
+                .config
+                .join_policy
+                .as_ref()
+                .map(|policy| policy.version.as_str()),
+        )
+        .await
+        .map_err(|e| internal_error(&format!("invite claim insert: {e}")))
+}
+
+/// Log and publish the NIP-43 member-added + membership-list deltas after a
+/// newly inserted member.
+async fn announce_member_added(
+    state: &Arc<AppState>,
+    tenant: &buzz_core::TenantContext,
+    member_hex: &str,
+) {
+    tracing::info!(
+        community = %tenant.community(),
+        member = %member_hex,
+        "relay member added via invite"
+    );
+    if let Err(e) = publish_nip43_member_added(tenant, state, member_hex).await {
+        tracing::warn!("failed to publish NIP-43 member-added delta after claim: {e}");
+    }
+    if let Err(e) = publish_nip43_membership_list(tenant, state).await {
+        tracing::warn!("failed to publish NIP-43 membership list after claim: {e}");
+    }
+}
+
+/// Generate a fresh random member token and its storage hash.
+///
+/// Mirrors `buzz-admin`'s `generate_token`: [`MEMBER_TOKEN_RANDOM_BYTES`] of
+/// CSPRNG entropy, hex-encoded, prefixed with [`MEMBER_TOKEN_PREFIX`]. The hash
+/// is SHA-256 over the full token string — the exact transform
+/// [`buzz_auth::AuthService::verify_api_key`] applies to a presented bearer
+/// token, so the returned plaintext round-trips as a credential unchanged.
+/// Returns `(plaintext, sha256_hash)`; the plaintext is the only place the
+/// secret is materialised.
+fn generate_member_token() -> (String, [u8; 32]) {
+    let bytes: [u8; MEMBER_TOKEN_RANDOM_BYTES] = rand::random();
+    let token = format!("{MEMBER_TOKEN_PREFIX}{}", hex::encode(bytes));
+    let hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
+    (token, hash)
 }
 
 /// Fixed-window rate limit on claim attempts, keyed by community and claimer
@@ -380,6 +648,22 @@ fn claim_rate_limited(
         &state.invite_claim_rate_limiter,
         (community, pubkey.to_bytes()),
     )
+}
+
+/// Fixed-window rate limit on `apikey`-mode claim attempts, keyed by community
+/// and the **invite-code hash** (the unauthenticated path has no pubkey).
+///
+/// Each valid claim mints a fresh actor+key, so this bounds how fast one code
+/// can be spent into keys. The key is SHA-256 of the code, reusing the same
+/// bounded, expiring cache as the pubkey path — a flood of distinct codes cannot
+/// grow it without bound.
+fn claim_rate_limited_by_code(
+    state: &AppState,
+    community: buzz_core::tenant::CommunityId,
+    code: &str,
+) -> bool {
+    let code_hash: [u8; 32] = Sha256::digest(code.as_bytes()).into();
+    claim_key_rate_limited(&state.invite_claim_rate_limiter, (community, code_hash))
 }
 
 fn claim_key_rate_limited(
@@ -401,6 +685,7 @@ mod tests {
         http::{header, Request, StatusCode},
     };
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use buzz_auth::Scope;
     use hmac::{Hmac, KeyInit, Mac};
     use nostr::{EventBuilder, EventId, Keys, Kind, Tag};
     use serde_json::Value;
@@ -514,6 +799,14 @@ mod tests {
     /// Build a closed-relay (`require_relay_membership = true`) test state with
     /// a fresh community on `host`; returns `None` when Postgres is unavailable.
     async fn invite_test_state(host: &str) -> Option<Arc<AppState>> {
+        invite_test_state_with_mode(host, buzz_auth::AuthMode::Nostr).await
+    }
+
+    /// Build a closed-relay test state on `host` under the given auth mode.
+    async fn invite_test_state_with_mode(
+        host: &str,
+        auth_mode: buzz_auth::AuthMode,
+    ) -> Option<Arc<AppState>> {
         let mut config = crate::config::Config::from_env().ok()?;
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
@@ -521,6 +814,7 @@ mod tests {
         config.database_url = database_url.clone();
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.relay_url = format!("wss://{host}");
+        config.auth.auth_mode = auth_mode;
         // The claim route must work on relays where membership is enforced —
         // that is the entire point of an invite.
         config.require_relay_membership = true;
@@ -1300,5 +1594,342 @@ mod tests {
 
         let response = get_page(state, "/api/join-policy/privacy").await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ---- apikey mode ----
+
+    /// Seed a user row and an active bearer API key with the given scopes,
+    /// returning the plaintext token. Reuses the production token generator so
+    /// the seeded key hashes exactly as `verify_api_key` expects.
+    async fn seed_bearer_key(
+        state: &AppState,
+        community: buzz_core::CommunityId,
+        actor: &[u8; 32],
+        scopes: &[&str],
+    ) -> String {
+        state
+            .db
+            .ensure_user(community, actor)
+            .await
+            .expect("ensure user");
+        let (token, hash) = super::generate_member_token();
+        let scope_strings: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
+        state
+            .db
+            .create_api_token(
+                community,
+                &hash,
+                actor,
+                "test-key",
+                &scope_strings,
+                None,
+                None,
+            )
+            .await
+            .expect("create token");
+        token
+    }
+
+    async fn post_bearer(
+        state: Arc<AppState>,
+        host: &str,
+        path: &str,
+        token: &str,
+        body: String,
+    ) -> axum::response::Response {
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(header::HOST, host)
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+    }
+
+    async fn post_unauth(
+        state: Arc<AppState>,
+        host: &str,
+        path: &str,
+        body: String,
+    ) -> axum::response::Response {
+        build_router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header(header::HOST, host)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+    }
+
+    async fn apikey_community(host: &str) -> Option<(Arc<AppState>, buzz_core::CommunityId)> {
+        let state = invite_test_state_with_mode(host, buzz_auth::AuthMode::ApiKey).await?;
+        let community = state
+            .db
+            .lookup_community_by_host(host)
+            .await
+            .expect("lookup")
+            .expect("community exists");
+        Some((state, community.id))
+    }
+
+    /// End-to-end apikey flow: an admin-scoped bearer mints an invite; an
+    /// unauthenticated claim mints a fresh actor + self-minted member key and
+    /// returns both. The returned key verifies and carries the member scope set
+    /// (never an admin scope).
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn apikey_mint_and_claim_end_to_end() {
+        let host = format!("invites-apikey-{}.example", Uuid::new_v4().simple());
+        let Some((state, cid)) = apikey_community(&host).await else {
+            return;
+        };
+
+        let admin_actor: [u8; 32] = rand::random();
+        let admin_token = seed_bearer_key(&state, cid, &admin_actor, &["admin:users"]).await;
+
+        // Mint via bearer.
+        let response = post_bearer(
+            state.clone(),
+            &host,
+            "/api/invites",
+            &admin_token,
+            "{}".to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let code = read_json(response)
+            .await
+            .get("code")
+            .and_then(Value::as_str)
+            .expect("code")
+            .to_string();
+
+        // Claim unauthenticated — the code is the credential.
+        let claim_body = serde_json::json!({ "code": code }).to_string();
+        let response = post_unauth(state.clone(), &host, "/api/invites/claim", claim_body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = read_json(response).await;
+        assert_eq!(json.get("status").and_then(Value::as_str), Some("joined"));
+        assert_eq!(json.get("role").and_then(Value::as_str), Some("member"));
+
+        let api_key = json
+            .get("api_key")
+            .and_then(Value::as_str)
+            .expect("api_key in response");
+        assert!(api_key.starts_with("buzzk_"), "unexpected key: {api_key}");
+        let actor = json
+            .get("actor")
+            .and_then(Value::as_str)
+            .expect("actor in response");
+        assert_eq!(actor.len(), 64, "actor must be a 64-hex id");
+        assert_eq!(hex::decode(actor).expect("actor hex").len(), 32);
+
+        // The freshly minted actor is now a relay member.
+        let member = state
+            .db
+            .get_relay_member(cid, actor)
+            .await
+            .expect("member lookup")
+            .expect("actor is now a member");
+        assert_eq!(member.role, "member");
+
+        // The returned key verifies and grants exactly the member scope set.
+        let ctx = state
+            .auth
+            .verify_api_key(api_key, cid, &state.db)
+            .await
+            .expect("returned key must verify");
+        assert!(ctx.has_scope(&Scope::MessagesRead));
+        assert!(ctx.has_scope(&Scope::MessagesWrite));
+        assert!(ctx.has_scope(&Scope::ChannelsRead));
+        assert!(ctx.has_scope(&Scope::UsersRead));
+        assert!(ctx.has_scope(&Scope::UsersWrite));
+        assert!(ctx.has_scope(&Scope::FilesRead));
+        assert!(ctx.has_scope(&Scope::FilesWrite));
+        assert!(ctx.has_scope(&Scope::SubscriptionsRead));
+        // Never an admin/elevated scope.
+        assert!(!ctx.has_scope(&Scope::AdminUsers));
+        assert!(!ctx.has_scope(&Scope::AdminChannels));
+        assert!(!ctx.has_scope(&Scope::ChannelsWrite));
+    }
+
+    /// Each claim of the same code mints a *new* actor + key (invite on a new
+    /// device = a new identity), and both always report `joined`.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn apikey_claim_mints_fresh_actor_each_time() {
+        let host = format!("invites-apikey-{}.example", Uuid::new_v4().simple());
+        let Some((state, cid)) = apikey_community(&host).await else {
+            return;
+        };
+        let admin_actor: [u8; 32] = rand::random();
+        let admin_token = seed_bearer_key(&state, cid, &admin_actor, &["admin:users"]).await;
+
+        let response = post_bearer(
+            state.clone(),
+            &host,
+            "/api/invites",
+            &admin_token,
+            "{}".to_string(),
+        )
+        .await;
+        let code = read_json(response)
+            .await
+            .get("code")
+            .and_then(Value::as_str)
+            .expect("code")
+            .to_string();
+        let claim_body = serde_json::json!({ "code": code }).to_string();
+
+        let first = read_json(
+            post_unauth(
+                state.clone(),
+                &host,
+                "/api/invites/claim",
+                claim_body.clone(),
+            )
+            .await,
+        )
+        .await;
+        let second =
+            read_json(post_unauth(state.clone(), &host, "/api/invites/claim", claim_body).await)
+                .await;
+
+        assert_eq!(first.get("status").and_then(Value::as_str), Some("joined"));
+        assert_eq!(second.get("status").and_then(Value::as_str), Some("joined"));
+        let actor_a = first.get("actor").and_then(Value::as_str).expect("actor a");
+        let actor_b = second
+            .get("actor")
+            .and_then(Value::as_str)
+            .expect("actor b");
+        let key_a = first.get("api_key").and_then(Value::as_str).expect("key a");
+        let key_b = second
+            .get("api_key")
+            .and_then(Value::as_str)
+            .expect("key b");
+        assert_ne!(actor_a, actor_b, "each claim must mint a distinct actor");
+        assert_ne!(key_a, key_b, "each claim must mint a distinct key");
+    }
+
+    /// Mint in apikey mode requires the `admin:users` scope; a member-scoped key
+    /// is 403 and a missing bearer is 401.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn apikey_mint_requires_admin_users_scope() {
+        let host = format!("invites-apikey-{}.example", Uuid::new_v4().simple());
+        let Some((state, cid)) = apikey_community(&host).await else {
+            return;
+        };
+        let member_actor: [u8; 32] = rand::random();
+        let member_token = seed_bearer_key(
+            &state,
+            cid,
+            &member_actor,
+            &["messages:read", "messages:write"],
+        )
+        .await;
+
+        let response = post_bearer(
+            state.clone(),
+            &host,
+            "/api/invites",
+            &member_token,
+            "{}".to_string(),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "member-scoped key must not mint invites"
+        );
+
+        let response = post_unauth(state, &host, "/api/invites", "{}".to_string()).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "mint without a bearer must be 401"
+        );
+    }
+
+    /// An invalid code is rejected with the coarse `invite_invalid` body and
+    /// mints nothing.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn apikey_claim_rejects_invalid_code() {
+        let host = format!("invites-apikey-{}.example", Uuid::new_v4().simple());
+        let Some((state, _cid)) = apikey_community(&host).await else {
+            return;
+        };
+        let body = serde_json::json!({ "code": "garbage.code" }).to_string();
+        let response = post_unauth(state, &host, "/api/invites/claim", body).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let json = read_json(response).await;
+        assert_eq!(
+            json.get("error").and_then(Value::as_str),
+            Some("invite_invalid")
+        );
+    }
+
+    /// The join-policy gate is enforced on the apikey claim path too: a claim
+    /// with no receipt when a policy is configured is rejected and mints nothing.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn apikey_claim_enforces_join_policy() {
+        let host = format!("invites-apikey-{}.example", Uuid::new_v4().simple());
+        let Some((state, cid)) = apikey_community(&host).await else {
+            return;
+        };
+        let admin_actor: [u8; 32] = rand::random();
+        let admin_token = seed_bearer_key(&state, cid, &admin_actor, &["admin:users"]).await;
+
+        // Mint before forcing the policy on (mint itself has no policy gate).
+        let code = read_json(
+            post_bearer(
+                state.clone(),
+                &host,
+                "/api/invites",
+                &admin_token,
+                "{}".to_string(),
+            )
+            .await,
+        )
+        .await
+        .get("code")
+        .and_then(Value::as_str)
+        .expect("code")
+        .to_string();
+
+        // Force a join policy on this state.
+        let mut state_inner = (*state).clone();
+        let mut config = state_inner.config.as_ref().clone();
+        config.join_policy = Some(crate::config::JoinPolicyConfig {
+            terms_markdown: Some("# Terms".to_string()),
+            privacy_markdown: None,
+            age_attestation_required: false,
+            version: "c".repeat(64),
+        });
+        state_inner.config = Arc::new(config);
+        let state = Arc::new(state_inner);
+
+        // Claim without a receipt → 403 join_policy_required.
+        let body = serde_json::json!({ "code": code }).to_string();
+        let response = post_unauth(state, &host, "/api/invites/claim", body).await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let json = read_json(response).await;
+        assert_eq!(
+            json.get("error").and_then(Value::as_str),
+            Some("join_policy_required")
+        );
     }
 }

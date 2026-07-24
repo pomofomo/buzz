@@ -297,10 +297,19 @@ async fn nip11_or_ws_handler(
         }
     };
 
+    // Extract the API-key bearer token from the upgrade request (apikey mode).
+    // The token is presented as `Authorization: Bearer <token>` on the WebSocket
+    // HTTP upgrade — see `handle_connection`. Harmless/ignored in nostr mode.
+    let bearer_token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|t| t.trim().to_string());
+
     let max_frame_bytes = state.config.max_frame_bytes;
     match WebSocketUpgrade::from_request(req, &state).await {
         Ok(ws) => limit_relay_websocket(ws, max_frame_bytes)
-            .on_upgrade(move |socket| handle_connection(socket, state, addr, tenant))
+            .on_upgrade(move |socket| handle_connection(socket, state, addr, tenant, bearer_token))
             .into_response(),
         Err(_) => {
             // Browser requesting HTML and Git web GUI is enabled → serve SPA.

@@ -65,7 +65,10 @@ Future<void> createForumPost(
 }) async {
   final config = ref.read(relayConfigProvider);
   final session = ref.read(relaySessionProvider.notifier);
-  final relay = SignedEventRelay(session: session, nsec: config.nsec);
+  final relay = SignedEventRelay(
+    session: session,
+    actorPubkey: config.actorPubkey,
+  );
 
   final selfPubkey = relay.pubkey?.toLowerCase();
   final seen = <String>{?selfPubkey};
@@ -98,7 +101,10 @@ Future<void> createForumReply(
 }) async {
   final config = ref.read(relayConfigProvider);
   final session = ref.read(relaySessionProvider.notifier);
-  final relay = SignedEventRelay(session: session, nsec: config.nsec);
+  final relay = SignedEventRelay(
+    session: session,
+    actorPubkey: config.actorPubkey,
+  );
 
   final selfPubkey = relay.pubkey?.toLowerCase();
   final seen = <String>{?selfPubkey};

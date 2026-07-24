@@ -127,6 +127,14 @@ export type MockAgentMemoryListing = {
 };
 
 type MockBridgeOptions = {
+  /**
+   * Relay auth doorway reported by `get_auth_mode`. Defaults to `"nostr"`.
+   * Set to `"apikey"` (with `apiKey` set) to exercise the bearer doorway —
+   * see `tests/e2e/bearer-sign-in.spec.ts`.
+   */
+  authMode?: "apikey" | "nostr";
+  /** Bearer token returned by `get_api_key`/`has_api_key`. */
+  apiKey?: string | null;
   /** Advertised HEAD for the first mock project without adding that branch. */
   projectHeadBranch?: string;
   /** Relay NIP-11 identity used to sign authoritative repository state. */

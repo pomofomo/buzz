@@ -98,12 +98,23 @@ pub fn relay_api_base_url() -> String {
 
 // ── NIP-98 HTTP auth ────────────────────────────────────────────────────────
 
+/// Build the `Authorization` header for a state-authenticated HTTP bridge call.
+///
+/// In `apikey` auth mode (an API bearer token is configured via env or the OS
+/// keyring) this returns `Bearer <token>` — the server hashes the token,
+/// resolves the actor + scopes, and authors the row. Otherwise it falls back
+/// to the legacy NIP-98 signed-event header for the human identity keys. This
+/// keeps the Nostr doorway working while letting the desktop default to bearer
+/// once a key is provisioned.
 pub fn build_nip98_auth_header(
     method: &Method,
     url: &str,
     body: &[u8],
     state: &AppState,
 ) -> Result<String, String> {
+    if let Some(token) = state.api_key() {
+        return Ok(format!("Bearer {token}"));
+    }
     let keys = state.keys.lock().map_err(|error| error.to_string())?;
     build_nip98_auth_header_for_keys(&keys, method, url, body)
 }
@@ -554,7 +565,9 @@ pub async fn submit_event(
             .sign_with_keys(&keys)
             .map_err(|e| format!("failed to sign event: {e}"))?;
         let body = event.as_json().into_bytes();
-        let auth = build_nip98_auth_header_for_keys(&keys, &Method::POST, &url, &body)?;
+        // Bearer in apikey mode (server authors the row from the resolved
+        // actor; the body's signature is vestigial), NIP-98 otherwise.
+        let auth = build_nip98_auth_header(&Method::POST, &url, &body, state)?;
         (auth, body)
     }; // keys dropped here
 
@@ -595,9 +608,12 @@ pub async fn submit_signed_event(
     crate::relay_admission::wait_for_rate_limit().await;
     let url = format!("{}/events", relay_api_base_url_with_override(state));
     let body_bytes = event.as_json().into_bytes();
+    // Bearer in apikey mode (server authors the row), NIP-98 otherwise. The
+    // pre-signed body is published verbatim so the persona flush compare-and-
+    // clear still matches; only the request auth changes.
     let auth_header = {
-        let keys = state.signing_keys()?;
-        build_nip98_auth_header_for_keys(&keys, &Method::POST, &url, &body_bytes)?
+        let _keys = state.signing_keys()?;
+        build_nip98_auth_header(&Method::POST, &url, &body_bytes, state)?
     }; // keys dropped here
 
     let response = state

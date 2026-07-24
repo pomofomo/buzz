@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { queryEvents, type NostrEvent } from "@/shared/lib/nostr-client";
+import { queryRelayEvents, type NostrEvent } from "@/shared/lib/nostr-client";
 import { relayWsUrl } from "@/shared/lib/relay-url";
 import { dedup } from "./use-repos";
 
@@ -52,7 +52,7 @@ async function fetchRepoRefs(repoId: string): Promise<RepoRefs> {
   // TODO: Filter by `authors: [relayPubkey]` once the relay's own pubkey is
   // exposed to the client. Without this, a user with ReposWrite permission
   // could publish fake kind:30618 events with spoofed refs.
-  const events = await queryEvents(relayWsUrl(), {
+  const events = await queryRelayEvents(relayWsUrl(), {
     kinds: [30618],
     "#d": [repoId],
   });

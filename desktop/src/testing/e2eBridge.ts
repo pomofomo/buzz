@@ -133,6 +133,18 @@ type MockSearchProfileSeed = {
 type E2eConfig = {
   mode?: "mock" | "relay";
   mock?: {
+    /**
+     * Relay auth doorway reported by `get_auth_mode`. Defaults to `"nostr"`
+     * (the mock relay's legacy NIP-42 challenge/response). Set to `"apikey"`
+     * to exercise the bearer doorway: `connectMockSocket` then skips the
+     * unsolicited `AUTH` challenge (the real relay authenticates apikey
+     * connections at the WS upgrade, not via NIP-42) and `relayClientSession`
+     * marks the connection authenticated as soon as the socket opens.
+     */
+    authMode?: "apikey" | "nostr";
+    /** Bearer token returned by `get_api_key`/`has_api_key`. Null/omitted =
+     *  no key configured. */
+    apiKey?: string | null;
     /** Advertised HEAD for the first mock project without adding that branch. */
     projectHeadBranch?: string;
     /** Builderlab account returned by hosted-community onboarding. Null/omitted = signed out. */
@@ -8478,7 +8490,10 @@ async function connectRealSocket(args: { url?: string; onMessage: unknown }) {
   });
 }
 
-async function connectMockSocket(args: { onMessage: unknown }) {
+async function connectMockSocket(args: {
+  onMessage: unknown;
+  config?: { authorization?: string };
+}) {
   if (mockWebsocketSendMutexWedged) {
     return new Promise<number>(() => {});
   }
@@ -8491,9 +8506,18 @@ async function connectMockSocket(args: { onMessage: unknown }) {
     subscriptions: new Map(),
   });
 
-  window.setTimeout(() => {
-    sendWsText(handler, ["AUTH", `mock-challenge-${wsId}`]);
-  }, 0);
+  // A bearer `Authorization` header on the upgrade means apikey mode: the
+  // real relay authenticates at the upgrade and never sends a NIP-42 `AUTH`
+  // challenge. Sending one here anyway would make the mock relay send an
+  // unsolicited challenge the app was never designed to receive in apikey
+  // mode, and `relayClientSession` would sign + reply to it, polluting
+  // `__BUZZ_E2E_SIGNED_EVENTS__` with an event a real apikey session never
+  // produces.
+  if (!args.config?.authorization) {
+    window.setTimeout(() => {
+      sendWsText(handler, ["AUTH", `mock-challenge-${wsId}`]);
+    }, 0);
+  }
 
   return wsId;
 }
@@ -9773,6 +9797,15 @@ export function maybeInstallE2eTauriMocks() {
         return getRelayWsUrl(activeConfig);
       case "get_default_relay_url":
         return getRelayWsUrl(activeConfig);
+      // Auth-mode probe: defaults to the legacy Nostr doorway; a spec can
+      // opt into the bearer/apikey path via `mock.authMode`/`mock.apiKey`
+      // (see tests/e2e/bearer-sign-in.spec.ts).
+      case "get_auth_mode":
+        return activeConfig?.mock?.authMode ?? "nostr";
+      case "get_api_key":
+        return activeConfig?.mock?.apiKey ?? null;
+      case "has_api_key":
+        return Boolean(activeConfig?.mock?.apiKey);
       case "get_legacy_workspace_storage":
         return {
           workspaces: null,
@@ -10524,10 +10557,6 @@ export function maybeInstallE2eTauriMocks() {
             (payload as { createdAt?: number }).createdAt,
           ),
         );
-      case "nip44_encrypt_to_self":
-        return (payload as { plaintext: string }).plaintext;
-      case "nip44_decrypt_from_self":
-        return (payload as { ciphertext: string }).ciphertext;
       case "create_auth_event":
         if (identity) {
           return JSON.stringify(

@@ -3,6 +3,11 @@
 //! AUTH events (kind 22242) are never stored — they carry bearer tokens.
 //! Ephemeral events (kinds 20000–29999) are never stored — Redis pub/sub only.
 //! Deduplication is application-layer: ON CONFLICT DO NOTHING.
+//!
+//! The `pubkey` column is an opaque 32-byte actor id (crate-level docs).
+//! `sig` is nullable: legacy rows carry a real 64-byte Schnorr signature,
+//! server-authored rows may store NULL/empty. Rehydration never verifies the
+//! signature — see [`rehydrate_sig_hex`].
 
 use chrono::{DateTime, Utc};
 use nostr::Event;
@@ -508,6 +513,33 @@ pub async fn query_events(pool: &PgPool, q: &EventQuery) -> Result<Vec<StoredEve
     Ok(out)
 }
 
+/// Hex encoding of an all-zero 64-byte Schnorr signature (128 `0` chars).
+///
+/// Used as a placeholder when rehydrating a server-authored row whose `sig`
+/// column is NULL or empty. The `nostr::Event` wire type deserializes `sig`
+/// into a `secp256k1::schnorr::Signature`, which requires a syntactically
+/// valid 64-byte value — an empty string would fail to parse — so an all-zero
+/// signature stands in. This placeholder is never verified on the read path.
+const EMPTY_SIG_HEX: &str = "0000000000000000000000000000000000000000000000000000000000000000\
+0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Rehydrate the stored `sig` column into a hex signature string for the
+/// `nostr::Event` wire type.
+///
+/// Legacy Nostr-era rows carry a real 64-byte Schnorr signature, returned as
+/// its hex encoding. Server-authored rows (API-key auth mode) may store NULL or
+/// an empty `sig`; those rehydrate to [`EMPTY_SIG_HEX`], an all-zero placeholder,
+/// so the still-signature-shaped wire type can be constructed. The read path
+/// never verifies this value. A stored signature of the wrong length (e.g. a
+/// corrupt row) is passed through unchanged so downstream deserialization
+/// rejects it — preserving the skip-and-continue behavior for corrupt rows.
+pub fn rehydrate_sig_hex(sig: Option<&[u8]>) -> String {
+    match sig {
+        Some(bytes) if !bytes.is_empty() => hex::encode(bytes),
+        _ => EMPTY_SIG_HEX.to_string(),
+    }
+}
+
 pub(crate) fn row_to_stored_event(row: sqlx::postgres::PgRow) -> Result<Option<StoredEvent>> {
     let id_bytes: Vec<u8> = row.try_get("id")?;
     let pubkey_bytes: Vec<u8> = row.try_get("pubkey")?;
@@ -515,7 +547,10 @@ pub(crate) fn row_to_stored_event(row: sqlx::postgres::PgRow) -> Result<Option<S
     let kind_i32: i32 = row.try_get("kind")?;
     let tags_json: serde_json::Value = row.try_get("tags")?;
     let content: String = row.try_get("content")?;
-    let sig_bytes: Vec<u8> = row.try_get("sig")?;
+    // `sig` is nullable: server-authored rows may have no signature. A NULL or
+    // empty value rehydrates to an all-zero placeholder; the read path never
+    // verifies it.
+    let sig_bytes: Option<Vec<u8>> = row.try_get("sig")?;
     let received_at: DateTime<Utc> = row.try_get("received_at")?;
 
     let channel_id: Option<Uuid> = row.try_get("channel_id")?;
@@ -531,7 +566,7 @@ pub(crate) fn row_to_stored_event(row: sqlx::postgres::PgRow) -> Result<Option<S
         "kind": kind_u16,
         "tags": tags_json,
         "content": content,
-        "sig": hex::encode(&sig_bytes),
+        "sig": rehydrate_sig_hex(sig_bytes.as_deref()),
     });
 
     // Avoid the Value → String → parse round-trip: deserialize directly from the Value.
@@ -1329,7 +1364,13 @@ pub async fn query_due_reminders(
             kind: row.get("kind"),
             tags: row.get("tags"),
             content: row.get("content"),
-            sig: row.get("sig"),
+            // `sig` is nullable (server-authored rows). Read defensively so a
+            // NULL never panics; empty bytes rehydrate to a placeholder downstream.
+            sig: row
+                .try_get::<Option<Vec<u8>>, _>("sig")
+                .ok()
+                .flatten()
+                .unwrap_or_default(),
             channel_id: row.get("channel_id"),
         })
         .collect();

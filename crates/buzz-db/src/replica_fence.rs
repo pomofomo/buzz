@@ -521,7 +521,12 @@ mod tests {
         assert!(fence.verified_through().is_none(), "must start closed");
         assert!(!fence.covers(Utc::now() - chrono::Duration::days(365)));
 
-        let ts = Utc::now();
+        // The fence stores at microsecond precision (`timestamp_micros`), so a
+        // raw nanosecond-resolution `Utc::now()` does not round-trip exactly on
+        // high-resolution clocks (Linux). Truncate to micros up front so the
+        // equality holds on every platform, not just microsecond-clock ones.
+        let ts = DateTime::from_timestamp_micros(Utc::now().timestamp_micros())
+            .expect("current time is representable in microseconds");
         fence.advance(ts);
         assert_eq!(fence.verified_through(), Some(ts));
         assert!(fence.covers(ts - chrono::Duration::seconds(1)));

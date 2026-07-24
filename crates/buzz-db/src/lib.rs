@@ -8,6 +8,24 @@
 //! - Events table is partitioned by month on `created_at`.
 //! - No FK references to partitioned tables.
 //! - Uses `sqlx::query()` (runtime) not `sqlx::query!()` (compile-time).
+//!
+//! ## Identity: `pubkey` columns are opaque 32-byte actor ids
+//! The `pubkey` / `owner_pubkey` / `actor_pubkey` BYTEA columns across the
+//! schema no longer denote a Nostr public key specifically — they hold an
+//! opaque **32-byte actor identifier**. For legacy rows this identifier
+//! equals the historical Nostr pubkey; for server-authored rows (API-key auth
+//! mode) it is the resolved principal's actor id. The columns are *not*
+//! physically renamed (deliberate churn avoidance — see `REFACTOR.md` Lane A);
+//! the `CHECK (LENGTH(...) = 32)` constraints remain so any actor id fits the
+//! existing column shape. Treat these columns as opaque identity bytes, never
+//! as a key that can verify a signature.
+//!
+//! ## `events.sig` is optional
+//! `events.sig` is nullable (migration `0025`). Legacy rows keep their real
+//! 64-byte Schnorr signature; server-authored rows may store NULL or an empty
+//! signature. The read/rehydration path never verifies a signature — see
+//! [`event::rehydrate_sig_hex`] for how a NULL/empty `sig` is rehydrated into
+//! the still-signature-shaped `nostr::Event` wire type.
 
 /// Explicit deployment-global admin report reads.
 pub mod admin_moderation;

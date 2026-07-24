@@ -283,18 +283,51 @@ fn server_authority(url: &reqwest::Url) -> Option<String> {
     }
 }
 
-/// Mint a `t=get` Authorization header for `url` when it is relay-hosted
-/// media and `BUZZ_PRIVATE_KEY` is available; `None` otherwise.
+/// Returns `true` when media reads should authenticate with an API-key bearer
+/// token (apikey mode) rather than a signed Blossom `t=get` event (nostr mode).
+///
+/// apikey mode is engaged when `BUZZ_API_KEY` is present or `BUZZ_AUTH_MODE`
+/// names the apikey doorway (`apikey` / `api_key` / `api-key`).
+fn media_apikey_mode() -> bool {
+    if std::env::var("BUZZ_API_KEY")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    std::env::var("BUZZ_AUTH_MODE")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "apikey" | "api_key" | "api-key"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// Mint an Authorization header for `url` when it is relay-hosted media; `None`
+/// otherwise.
+///
+/// In apikey mode this is `Bearer <BUZZ_API_KEY>`. In nostr mode it is a signed
+/// Blossom `t=get` event minted from `BUZZ_PRIVATE_KEY`.
 ///
 /// Fail-open by design: while the relay's media-read-auth flag is off, an
-/// unauthenticated request still succeeds, so a missing/invalid key degrades
-/// to an unsigned fetch instead of an error. Once the flag is on, the fetch
-/// 403s and the error path below names the missing key.
+/// unauthenticated request still succeeds, so a missing/invalid credential
+/// degrades to an unsigned fetch instead of an error. Once the flag is on, the
+/// fetch 403s and the error path below names the missing credential.
 fn relay_media_get_auth(url: &reqwest::Url) -> Option<String> {
     let relay = std::env::var("BUZZ_RELAY_URL").ok()?;
     let relay = reqwest::Url::parse(&relay).ok()?;
     if !is_relay_media_url(url, &relay) {
         return None;
+    }
+    // apikey mode: bearer token, no Blossom signing.
+    if media_apikey_mode() {
+        return std::env::var("BUZZ_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty())
+            .map(|k| format!("Bearer {k}"));
     }
     let key = std::env::var("BUZZ_PRIVATE_KEY").ok()?;
     let keys = match nostr::Keys::parse(&key) {
@@ -338,9 +371,13 @@ async fn fetch_url(url: &str) -> Result<Vec<u8>, ErrorData> {
     let authed = auth.is_some();
     if let Some(header) = auth {
         req = req.header("Authorization", header);
-        if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
-            if !auth_tag.trim().is_empty() {
-                req = req.header("x-auth-tag", auth_tag);
+        // The x-auth-tag (NIP-OA) header only applies in nostr mode; in apikey
+        // mode the bearer token carries authority via the key's scopes.
+        if !media_apikey_mode() {
+            if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
+                if !auth_tag.trim().is_empty() {
+                    req = req.header("x-auth-tag", auth_tag);
+                }
             }
         }
     }
@@ -353,7 +390,8 @@ async fn fetch_url(url: &str) -> Result<Vec<u8>, ErrorData> {
         if matches!(status.as_u16(), 401 | 403) && !authed {
             return Err(invalid_params(format!(
                 "fetch {url} returned HTTP {status} — this relay requires authenticated media \
-                 reads; set BUZZ_PRIVATE_KEY (and BUZZ_RELAY_URL) to a member identity"
+                 reads; set BUZZ_API_KEY (apikey mode) or BUZZ_PRIVATE_KEY (nostr mode), \
+                 with BUZZ_RELAY_URL, to a member identity"
             )));
         }
         return Err(invalid_params(format!(

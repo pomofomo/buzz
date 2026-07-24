@@ -1,6 +1,4 @@
-use nostr::{
-    nips::nip44, Event, EventBuilder, JsonUtil, Keys, Kind, PublicKey, Tag, Timestamp, ToBech32,
-};
+use nostr::{Event, EventBuilder, JsonUtil, Keys, Kind, PublicKey, Tag, Timestamp, ToBech32};
 use tauri::Manager;
 use tauri::State;
 
@@ -80,6 +78,69 @@ pub fn get_media_proxy_port(state: State<'_, AppState>) -> u16 {
     state
         .media_proxy_port
         .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Resolve the active relay auth mode: `"apikey"` (bearer) or `"nostr"`
+/// (NIP-42/NIP-98 signing). The `BUZZ_AUTH_MODE` env var is authoritative when
+/// set to a recognized value; otherwise the mode is `"apikey"` when an API
+/// bearer token is configured (env override or keyring) and `"nostr"`
+/// otherwise. This lets the desktop client default to the bearer doorway once
+/// a key is provisioned while still supporting the legacy Nostr doorway.
+#[tauri::command]
+pub fn get_auth_mode(state: State<'_, AppState>) -> String {
+    if let Ok(mode) = std::env::var("BUZZ_AUTH_MODE") {
+        let normalized = mode.trim().to_ascii_lowercase();
+        if normalized == "apikey" || normalized == "nostr" {
+            return normalized;
+        }
+    }
+    if state.api_key().is_some() {
+        "apikey".to_string()
+    } else {
+        "nostr".to_string()
+    }
+}
+
+/// Return the configured API bearer token, if any. The frontend attaches this
+/// as an `Authorization: Bearer <token>` header on the WebSocket upgrade and
+/// HTTP bridge calls when running in `apikey` auth mode. Returns `None` when no
+/// token is configured (the client then uses the Nostr doorway).
+#[tauri::command]
+pub fn get_api_key(state: State<'_, AppState>) -> Option<String> {
+    state.api_key()
+}
+
+/// Whether an API bearer token is currently configured (env override or
+/// keyring). Cheap check for the frontend to select the auth doorway without
+/// materializing the secret.
+#[tauri::command]
+pub fn has_api_key(state: State<'_, AppState>) -> bool {
+    state.api_key().is_some()
+}
+
+/// Persist an API bearer token into the OS keyring (alongside the nsec) and
+/// update the in-memory cache. The token is stored verbatim; the server hashes
+/// it on presentation and resolves the actor + scopes from the matching
+/// `api_tokens` row.
+#[tauri::command]
+pub fn set_api_key(key: String, state: State<'_, AppState>) -> Result<(), String> {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return Err("api key must not be empty".to_string());
+    }
+    crate::app_state::persist_api_key(trimmed)?;
+    state.set_cached_api_key(Some(trimmed.to_string()));
+    Ok(())
+}
+
+/// Remove the persisted API bearer token from the OS keyring and clear the
+/// in-memory cache. A subsequent `get_auth_mode` falls back to `"nostr"` unless
+/// `BUZZ_AUTH_MODE`/`BUZZ_API_KEY` force otherwise.
+#[tauri::command]
+pub fn clear_api_key(state: State<'_, AppState>) -> Result<(), String> {
+    crate::app_state::delete_persisted_api_key()?;
+    state.set_cached_api_key(None);
+    Ok(())
 }
 
 #[tauri::command]
@@ -438,41 +499,6 @@ pub async fn create_auth_event(
             .map_err(|error| format!("sign failed: {error}"))?;
 
         Ok(event.as_json())
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking failed: {e}"))?
-}
-
-#[tauri::command]
-pub async fn nip44_encrypt_to_self(
-    plaintext: String,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
-    let keys = state.signing_keys()?;
-
-    tauri::async_runtime::spawn_blocking(move || {
-        nip44::encrypt(
-            keys.secret_key(),
-            &keys.public_key(),
-            &plaintext,
-            nip44::Version::V2,
-        )
-        .map_err(|e| format!("nip44 encrypt failed: {e}"))
-    })
-    .await
-    .map_err(|e| format!("spawn_blocking failed: {e}"))?
-}
-
-#[tauri::command]
-pub async fn nip44_decrypt_from_self(
-    ciphertext: String,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
-    let keys = state.signing_keys()?;
-
-    tauri::async_runtime::spawn_blocking(move || {
-        nip44::decrypt(keys.secret_key(), &keys.public_key(), &ciphertext)
-            .map_err(|e| format!("nip44 decrypt failed: {e}"))
     })
     .await
     .map_err(|e| format!("spawn_blocking failed: {e}"))?

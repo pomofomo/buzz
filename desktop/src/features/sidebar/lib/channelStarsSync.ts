@@ -1,9 +1,5 @@
 import { relayClient } from "@/shared/api/relayClient";
-import {
-  nip44DecryptFromSelf,
-  nip44EncryptToSelf,
-  signRelayEvent,
-} from "@/shared/api/tauri";
+import { signRelayEvent } from "@/shared/api/tauri";
 import type { RelayEvent } from "@/shared/api/types";
 import { KIND_CHANNEL_STARS } from "@/shared/constants/kinds";
 import {
@@ -21,10 +17,12 @@ export type RemoteStars = {
   eventId: string;
 };
 
-async function decryptAndParse(event: RelayEvent): Promise<RemoteStars | null> {
+// Content is stored as plaintext JSON. Legacy rows written before E2E removal
+// hold NIP-44 ciphertext; JSON.parse throws on them and we treat the record as
+// absent (returns null) — no decrypt fallback.
+function parseRemoteStars(event: RelayEvent): RemoteStars | null {
   try {
-    const plaintext = await nip44DecryptFromSelf(event.content);
-    const store = parseStarPayload(JSON.parse(plaintext));
+    const store = parseStarPayload(JSON.parse(event.content));
     if (!store) return null;
     return { store, createdAt: event.created_at, eventId: event.id };
   } catch {
@@ -53,7 +51,7 @@ export class ChannelStarSyncManager {
       });
       if (events.length === 0) return null;
       if (events[0].pubkey !== this.pubkey) return null;
-      const result = await decryptAndParse(events[0]);
+      const result = parseRemoteStars(events[0]);
       if (result) {
         this.lastRemoteCreatedAt = Math.max(
           this.lastRemoteCreatedAt,
@@ -99,7 +97,7 @@ export class ChannelStarSyncManager {
         limit: 1,
       });
       if (events.length === 0 || events[0].pubkey !== this.pubkey) return store;
-      const remote = await decryptAndParse(events[0]);
+      const remote = parseRemoteStars(events[0]);
       if (!remote) return store;
       this.lastRemoteCreatedAt = Math.max(
         this.lastRemoteCreatedAt,
@@ -140,14 +138,14 @@ export class ChannelStarSyncManager {
         version: 1,
         channels: merged.channels,
       };
-      const ciphertext = await nip44EncryptToSelf(JSON.stringify(payload));
+      const content = JSON.stringify(payload);
       const createdAt = Math.max(
         Math.floor(Date.now() / 1_000),
         this.lastRemoteCreatedAt + 1,
       );
       const event = await signRelayEvent({
         kind: KIND_CHANNEL_STARS,
-        content: ciphertext,
+        content,
         createdAt,
         tags: [
           ["d", D_TAG],
@@ -182,15 +180,14 @@ export class ChannelStarSyncManager {
       },
       (event: RelayEvent) => {
         if (event.pubkey !== this.pubkey) return;
-        void decryptAndParse(event).then((result) => {
-          if (result) {
-            this.lastRemoteCreatedAt = Math.max(
-              this.lastRemoteCreatedAt,
-              result.createdAt,
-            );
-            onUpdate(result);
-          }
-        });
+        const result = parseRemoteStars(event);
+        if (result) {
+          this.lastRemoteCreatedAt = Math.max(
+            this.lastRemoteCreatedAt,
+            result.createdAt,
+          );
+          onUpdate(result);
+        }
       },
     );
   }

@@ -2,27 +2,28 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:nostr/nostr.dart' as nostr;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:buzz/features/channels/read_state/read_state_format.dart';
 import 'package:buzz/features/channels/read_state/read_state_manager.dart';
 import 'package:buzz/shared/relay/relay.dart';
 
+// A stable actor id (formerly the Nostr pubkey column) for the local reader.
+const _pubkey =
+    'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+
+// Read-state blobs are server-side plaintext under the API-key model — the
+// crypto pass-through neither encrypts nor decrypts.
+const _crypto = ReadStateCrypto();
+
 void main() {
   test('dispose flushes a pending publish after marking disposed', () async {
     SharedPreferences.setMockInitialValues({});
     final prefs = await SharedPreferences.getInstance();
-    final keychain = nostr.Keys.generate();
-    final nsec = keychain.nsec;
-    final crypto = ReadStateCrypto.tryCreate(
-      nsec: nsec,
-      pubkey: keychain.public,
-    );
     final relay = _FakeSignedEventRelay();
     final manager = ReadStateManager(
-      pubkey: keychain.public,
+      pubkey: _pubkey,
       prefs: prefs,
-      crypto: crypto!,
+      crypto: _crypto,
       relaySession: null,
       signedEventRelay: relay,
       remoteEnabled: true,
@@ -47,17 +48,11 @@ void main() {
   test('disables remote sync after relay rejects read-state kind', () async {
     SharedPreferences.setMockInitialValues({});
     final prefs = await SharedPreferences.getInstance();
-    final keychain = nostr.Keys.generate();
-    final nsec = keychain.nsec;
-    final crypto = ReadStateCrypto.tryCreate(
-      nsec: nsec,
-      pubkey: keychain.public,
-    );
     final relay = _UnsupportedKindSignedEventRelay();
     final manager = ReadStateManager(
-      pubkey: keychain.public,
+      pubkey: _pubkey,
       prefs: prefs,
-      crypto: crypto!,
+      crypto: _crypto,
       relaySession: null,
       signedEventRelay: relay,
       remoteEnabled: true,
@@ -75,21 +70,15 @@ void main() {
   });
 
   test(
-    'disables remote sync after token permanently lacks write scope',
+    'disables remote sync after the token permanently lacks write scope',
     () async {
       SharedPreferences.setMockInitialValues({});
       final prefs = await SharedPreferences.getInstance();
-      final keychain = nostr.Keys.generate();
-      final nsec = keychain.nsec;
-      final crypto = ReadStateCrypto.tryCreate(
-        nsec: nsec,
-        pubkey: keychain.public,
-      );
       final relay = _MissingScopeSignedEventRelay();
       final manager = ReadStateManager(
-        pubkey: keychain.public,
+        pubkey: _pubkey,
         prefs: prefs,
-        crypto: crypto!,
+        crypto: _crypto,
         relaySession: null,
         signedEventRelay: relay,
         remoteEnabled: true,
@@ -110,16 +99,11 @@ void main() {
   test('remote read-state rollback is ignored', () async {
     SharedPreferences.setMockInitialValues({});
     final prefs = await SharedPreferences.getInstance();
-    final keychain = nostr.Keys.generate();
-    final crypto = ReadStateCrypto.tryCreate(
-      nsec: keychain.nsec,
-      pubkey: keychain.public,
-    );
     final relay = _FakeRelaySession();
     final manager = ReadStateManager(
-      pubkey: keychain.public,
+      pubkey: _pubkey,
       prefs: prefs,
-      crypto: crypto!,
+      crypto: _crypto,
       relaySession: relay,
       signedEventRelay: _FakeSignedEventRelay(),
       remoteEnabled: true,
@@ -128,16 +112,16 @@ void main() {
 
     relay.historyEvents = [
       _readStateEvent(
-        pubkey: keychain.public,
-        crypto: crypto,
+        pubkey: _pubkey,
+        crypto: _crypto,
         clientId: 'remote-client',
         slotId: 'remote-slot',
         contexts: {'channel-1': 100},
         createdAt: 100,
       ),
       _readStateEvent(
-        pubkey: keychain.public,
-        crypto: crypto,
+        pubkey: _pubkey,
+        crypto: _crypto,
         clientId: 'remote-client',
         slotId: 'remote-slot',
         contexts: {'channel-1': 50},
@@ -158,7 +142,8 @@ class _SubmittedEvent {
   const _SubmittedEvent({required this.kind, required this.tags});
 }
 
-/// Build a stub NostrEvent for tests that just need a "ack" return value.
+/// Build a stub OK-response NostrEvent (the shape SignedEventRelay.submit
+/// returns from the relay's OK frame).
 NostrEvent _stubAckEvent() => const NostrEvent(
   id: 'stub',
   pubkey: '',
@@ -242,7 +227,7 @@ NostrEvent _readStateEvent({
       ['t', 'read-state'],
     ],
     content: crypto.encrypt(jsonEncode(blob.toJson())),
-    sig: 'sig',
+    sig: '',
   );
 }
 

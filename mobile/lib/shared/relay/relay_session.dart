@@ -3,9 +3,6 @@ import 'dart:convert';
 import 'dart:math';
 
 import 'package:http/http.dart' as http;
-import 'package:nostr/nostr.dart' as nostr;
-import 'package:pointycastle/digests/sha256.dart';
-import 'package:uuid/uuid.dart';
 
 import 'package:flutter/foundation.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
@@ -68,7 +65,7 @@ class _BufferedEvent {
 typedef RelaySocketFactory =
     RelaySocket Function({
       required String wsUrl,
-      required String? nsec,
+      required String? apiKey,
       required void Function(List<dynamic> message) onMessage,
       required void Function() onConnected,
       required void Function(Object? error) onDisconnected,
@@ -117,9 +114,9 @@ class RelaySessionNotifier extends Notifier<SessionState> {
 
     ref.onDispose(_dispose);
 
-    // Auto-connect when authenticated and we have a signing key (NIP-42 AUTH).
+    // Auto-connect when authenticated and we have an API key (bearer auth).
     final isAuthenticated = authState.value?.status == AuthStatus.authenticated;
-    if (isAuthenticated && config.nsec != null) {
+    if (isAuthenticated && config.apiKey != null) {
       // Schedule connection after build completes.
       Future.microtask(() => _connect(config));
     }
@@ -143,12 +140,8 @@ class RelaySessionNotifier extends Notifier<SessionState> {
         .post(
           Uri.parse(url),
           headers: {
-            'Authorization': buildNip98AuthHeader(
-              method: 'POST',
-              url: url,
-              bodyBytes: bodyBytes,
-              nsec: config.nsec,
-            ),
+            if (config.apiKey != null && config.apiKey!.isNotEmpty)
+              'Authorization': 'Bearer ${config.apiKey}',
             'Content-Type': 'application/json',
           },
           body: bodyBytes,
@@ -360,7 +353,7 @@ class RelaySessionNotifier extends Notifier<SessionState> {
     _socket?.dispose();
     final socket = _socketFactory(
       wsUrl: config.wsUrl,
-      nsec: config.nsec,
+      apiKey: config.apiKey,
       onMessage: (message) {
         if (generation == _connectionGeneration) _handleMessage(message);
       },
@@ -652,35 +645,3 @@ final relaySessionProvider =
     NotifierProvider<RelaySessionNotifier, SessionState>(
       RelaySessionNotifier.new,
     );
-
-String buildNip98AuthHeader({
-  required String method,
-  required String url,
-  required List<int> bodyBytes,
-  required String? nsec,
-}) {
-  if (nsec == null || nsec.isEmpty) {
-    throw Exception('Cannot query relay: no signing key available');
-  }
-  final privkeyHex = nostr.Nip19.decode(payload: nsec).data;
-  if (privkeyHex.isEmpty) {
-    throw Exception('Invalid nsec');
-  }
-  final payloadHash = SHA256Digest()
-      .process(Uint8List.fromList(bodyBytes))
-      .map((byte) => byte.toRadixString(16).padLeft(2, '0'))
-      .join();
-  final event = nostr.Event.from(
-    kind: 27235,
-    content: '',
-    tags: [
-      ['u', url],
-      ['method', method.toUpperCase()],
-      ['payload', payloadHash],
-      ['nonce', const Uuid().v4()],
-    ],
-    secretKey: privkeyHex,
-    verify: false,
-  );
-  return 'Nostr ${base64.encode(utf8.encode(event.toJson()))}';
-}

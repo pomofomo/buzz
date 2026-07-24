@@ -10,6 +10,8 @@ import {
   type SignedNostrEvent,
   signNostrEvent,
 } from "@/shared/lib/nostr-signer";
+import { getBearerToken } from "@/shared/lib/auth-mode";
+import { relayHttpBaseUrl } from "@/shared/lib/relay-url";
 
 export interface NostrFilter {
   ids?: string[];
@@ -24,6 +26,49 @@ export interface NostrFilter {
 export type NostrEvent = SignedNostrEvent;
 
 const QUERY_TIMEOUT_MS = 10_000;
+
+/**
+ * Fetch events via the relay HTTP `POST /query` bridge using a bearer token.
+ *
+ * Used in `apikey` mode: a browser `WebSocket` cannot attach the
+ * `Authorization: Bearer` header the relay requires at the WS upgrade, so
+ * reads go over HTTP where the header can be set. The bridge returns the same
+ * event row shape as the WS REQ path.
+ */
+export async function queryEventsHttp(
+  filter: NostrFilter,
+  token: string,
+): Promise<NostrEvent[]> {
+  const response = await fetch(`${relayHttpBaseUrl()}/query`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify([filter]),
+  });
+  if (!response.ok) {
+    throw new Error(`Relay query failed: ${response.status}`);
+  }
+  const data: unknown = await response.json();
+  return Array.isArray(data) ? (data as NostrEvent[]) : [];
+}
+
+/**
+ * Query events over the appropriate doorway: the HTTP bearer bridge in
+ * `apikey` mode, or the NIP-42 WebSocket path otherwise. Returns the same
+ * event shape in both modes, so read consumers need no change.
+ */
+export function queryRelayEvents(
+  wsUrl: string,
+  filter: NostrFilter,
+): Promise<NostrEvent[]> {
+  const token = getBearerToken();
+  if (token) {
+    return queryEventsHttp(filter, token);
+  }
+  return queryEvents(wsUrl, filter);
+}
 
 /**
  * Open a WebSocket to `wsUrl`, authenticate via NIP-42 if challenged,
