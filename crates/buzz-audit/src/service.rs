@@ -233,6 +233,54 @@ impl AuditService {
         rows.iter().map(row_to_audit_entry).collect()
     }
 
+    /// Return the current head (highest `seq`) of one community's chain, or
+    /// `None` if the community has no audit entries yet.
+    ///
+    /// Read-only and community-scoped — it can never observe another community's
+    /// rows. Used by the operator cutover tooling to pin the last Nostr-era head
+    /// hash and timestamp before appending the cutover genesis entry.
+    #[instrument(skip(self))]
+    pub async fn head(&self, community: CommunityId) -> Result<Option<AuditEntry>, AuditError> {
+        let row = sqlx::query(
+            r#"
+            SELECT community_id, seq, hash, prev_hash, action, actor_pubkey,
+                   object_id, detail, created_at
+            FROM audit_log
+            WHERE community_id = $1
+            ORDER BY seq DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(community.as_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        row.as_ref().map(row_to_audit_entry).transpose()
+    }
+
+    /// Whether one community's chain already contains a
+    /// [`AuditAction::CutoverGenesis`] entry.
+    ///
+    /// Read-only and community-scoped. The cutover tooling calls this to stay
+    /// idempotent: a community that has already been cut over must not have a
+    /// second genesis appended.
+    #[instrument(skip(self))]
+    pub async fn has_cutover_genesis(&self, community: CommunityId) -> Result<bool, AuditError> {
+        let exists: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1 FROM audit_log
+                WHERE community_id = $1 AND action = $2
+            )
+            "#,
+        )
+        .bind(community.as_uuid())
+        .bind(AuditAction::CutoverGenesis.as_str())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(exists)
+    }
+
     /// Append a **cutover genesis** entry marking a community's migration off
     /// the Nostr substrate onto API-key auth (decision #4).
     ///
@@ -610,6 +658,75 @@ mod tests {
             .verify_chain(CommunityId::from_uuid(c), 1, genesis.seq)
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn head_returns_none_then_tracks_the_tip() {
+        let _g = db_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let svc = AuditService::new(pool.clone());
+        let c = make_community(&pool).await;
+        let cid = CommunityId::from_uuid(c);
+
+        // Fresh community: no head.
+        assert!(svc.head(cid).await.unwrap().is_none());
+
+        let e1 = svc
+            .log(new_entry(c, AuditAction::EventCreated))
+            .await
+            .unwrap();
+        let head1 = svc
+            .head(cid)
+            .await
+            .unwrap()
+            .expect("head after first entry");
+        assert_eq!(head1.seq, e1.seq);
+        assert_eq!(head1.hash, e1.hash);
+
+        let e2 = svc
+            .log(new_entry(c, AuditAction::ChannelCreated))
+            .await
+            .unwrap();
+        let head2 = svc
+            .head(cid)
+            .await
+            .unwrap()
+            .expect("head after second entry");
+        assert_eq!(head2.seq, e2.seq, "head tracks the highest seq");
+        assert_eq!(head2.hash, e2.hash);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn has_cutover_genesis_flips_after_append() {
+        let _g = db_lock().lock().await;
+        let Some(pool) = test_pool().await else {
+            return;
+        };
+        let svc = AuditService::new(pool.clone());
+        let c = make_community(&pool).await;
+        let cid = CommunityId::from_uuid(c);
+
+        svc.log(new_entry(c, AuditAction::EventCreated))
+            .await
+            .unwrap();
+        assert!(
+            !svc.has_cutover_genesis(cid).await.unwrap(),
+            "no cutover genesis before it is appended"
+        );
+
+        let head = svc.head(cid).await.unwrap().expect("head");
+        svc.append_cutover_genesis(cid, &head.hash, head.created_at, None)
+            .await
+            .unwrap();
+
+        assert!(
+            svc.has_cutover_genesis(cid).await.unwrap(),
+            "cutover genesis detected after append"
+        );
     }
 
     #[tokio::test]

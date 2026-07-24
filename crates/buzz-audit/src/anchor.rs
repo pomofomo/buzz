@@ -510,4 +510,96 @@ mod tests {
         // enabled = false → returns without building a client or touching S3.
         run_anchor_worker(pool, AnchorConfig::default(), std::future::ready(())).await;
     }
+
+    /// End-to-end WORM proof against a live S3-compatible store (MinIO).
+    ///
+    /// Seeds one community's audit chain, anchors every head, then reads the
+    /// written object back and asserts it carries the head's seq and hash — the
+    /// property an operator relies on to detect a later Postgres rewrite.
+    ///
+    /// Gated on both Postgres and the MinIO env being reachable; skips (returns)
+    /// when either is absent so it never breaks the offline unit run. Point it
+    /// at a bucket with:
+    /// ```text
+    /// DATABASE_URL=postgres://buzz:buzz_dev@localhost:5432/buzz \
+    /// BUZZ_AUDIT_ANCHOR_S3_ENDPOINT=http://localhost:9000 \
+    /// BUZZ_AUDIT_ANCHOR_S3_ACCESS_KEY=buzz_dev \
+    /// BUZZ_AUDIT_ANCHOR_S3_SECRET_KEY=buzz_dev_secret \
+    /// BUZZ_AUDIT_ANCHOR_BUCKET=buzz-audit-worm \
+    /// cargo test -p buzz-audit anchor::tests::anchor_all_writes_head_to_worm -- --ignored
+    /// ```
+    #[tokio::test]
+    #[ignore = "requires Postgres + MinIO (live WORM anchor test)"]
+    async fn anchor_all_writes_head_to_worm() {
+        use crate::{action::AuditAction, entry::NewAuditEntry, AuditService};
+        use buzz_core::CommunityId;
+
+        let db_url = match std::env::var("DATABASE_URL") {
+            Ok(u) => u,
+            Err(_) => return,
+        };
+        let Ok(pool) = PgPool::connect(&db_url).await else {
+            return;
+        };
+
+        // Seed a fresh community with two audit entries; the tip is the head.
+        let community = Uuid::new_v4();
+        let host = format!("anchor-worm-{community}.example");
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(community)
+            .bind(host)
+            .execute(&pool)
+            .await
+            .expect("insert community");
+
+        let svc = AuditService::new(pool.clone());
+        let cid = CommunityId::from_uuid(community);
+        let mk = |action| NewAuditEntry {
+            community_id: cid,
+            action,
+            actor_pubkey: Some(vec![0x11; 32]),
+            object_id: None,
+            detail: serde_json::json!({"anchor": "test"}),
+        };
+        svc.log(mk(AuditAction::EventCreated)).await.expect("e1");
+        let head = svc.log(mk(AuditAction::ChannelCreated)).await.expect("e2");
+
+        // Anchor to MinIO. Force enabled + the anchor-specific bucket/creds so
+        // the test does not depend on a fully-populated ambient environment.
+        let mut config = AnchorConfig::from_env();
+        config.enabled = true;
+        if config.bucket.is_empty() {
+            config.bucket = "buzz-audit-worm".to_string();
+        }
+        if config.access_key.is_empty() && config.secret_key.is_empty() {
+            config.access_key = "buzz_dev".to_string();
+            config.secret_key = "buzz_dev_secret".to_string();
+        }
+
+        let anchor = AuditAnchor::from_config(pool.clone(), &config).expect("anchor client");
+        let written = anchor.anchor_all().await.expect("anchor sweep");
+        assert!(
+            written >= 1,
+            "at least this community's head must be written"
+        );
+
+        // Read the object back and prove it pins the head seq + hash.
+        let payload = AnchorPayload::new(community, head.seq, &head.hash, Utc::now());
+        let key = payload.object_key();
+        let response = anchor
+            .bucket
+            .get_object(&key)
+            .await
+            .unwrap_or_else(|e| panic!("read anchored object {key}: {e}"));
+        let fetched: AnchorPayload =
+            serde_json::from_slice(response.as_slice()).expect("anchored JSON parses");
+
+        assert_eq!(fetched.community_id, community);
+        assert_eq!(fetched.seq, head.seq, "anchored seq must equal chain head");
+        assert_eq!(
+            fetched.hash,
+            hex::encode(&head.hash),
+            "anchored hash must equal chain-head hash (lowercase hex)"
+        );
+    }
 }

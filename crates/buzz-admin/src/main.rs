@@ -21,6 +21,7 @@
 //! the guard against parallel adds (e.g. `xargs -P`).
 
 mod apikey;
+mod cutover;
 
 use std::sync::Arc;
 
@@ -147,6 +148,34 @@ enum Command {
         #[arg(long)]
         id: Uuid,
     },
+    /// Batch-mint one API key per existing active relay member (cutover
+    /// backfill — see REFACTOR.md §7).
+    ///
+    /// For every member on this community's relay roster that does not already
+    /// hold an active key, mints a key scoped to their role (member scopes by
+    /// default; admins/owners also get the elevated admin scopes) and prints a
+    /// TSV of `actor → plaintext key` to stdout. The plaintext keys are printed
+    /// **exactly once** — capture the output. Existing `pubkey` values stay
+    /// valid opaque actor ids, so history remains attributed. Idempotent: a
+    /// re-run skips actors that already have an active key.
+    BackfillKeys {
+        /// Preview only — resolve the plan and print who *would* be minted for,
+        /// without creating any key or writing to the database.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Append the audit cutover-genesis entry for one community (or --all).
+    ///
+    /// Records an [`AuditAction::CutoverGenesis`] entry pinning the last
+    /// Nostr-era head hash + timestamp, so pre-cutover history stays anchored to
+    /// the chain that continues under API-key auth (REFACTOR.md §7). Idempotent:
+    /// refuses a community that already carries a cutover-genesis entry.
+    CutoverGenesis {
+        /// Apply to every community in the deployment instead of just the one
+        /// resolved from RELAY_URL.
+        #[arg(long)]
+        all: bool,
+    },
     /// Run pending database migrations.
     Migrate,
     /// Inspect deployment-wide Buzz product feedback.
@@ -236,6 +265,8 @@ async fn run(cli: Cli) -> Result<i32> {
         Command::RevokeAllKeys { actor } => cmd_revoke_all_keys(actor).await,
         Command::ListKeys { actor } => cmd_list_keys(actor).await,
         Command::RotateKey { actor, id } => cmd_rotate_key(actor, id).await,
+        Command::BackfillKeys { dry_run } => cmd_backfill_keys(dry_run).await,
+        Command::CutoverGenesis { all } => cmd_cutover_genesis(all).await,
     }
 }
 
@@ -508,6 +539,148 @@ async fn cmd_rotate_key(actor_arg: String, id: Uuid) -> Result<i32> {
             channel_ids,
             existing.expires_at,
         )
+    );
+    Ok(0)
+}
+
+/// `backfill-keys` — mint one API key per active relay member (REFACTOR.md §7).
+///
+/// "Active actor" is grounded in the **relay membership roster**
+/// (`relay_members`): it is the set of identities admitted to participate on
+/// this relay — the same set the invite-claim path self-mints a member key for
+/// — so it is the authoritative "who currently participates". Each member's
+/// existing `pubkey` is reused verbatim as the opaque actor id, keeping all
+/// historical rows attributed. Actors that already hold an active (non-revoked,
+/// non-expired) key are skipped, so re-runs are idempotent.
+///
+/// On an open relay that does not enforce membership, the roster may not list
+/// every event author; such deployments should issue keys individually with
+/// `issue-key` (see CUTOVER.md).
+async fn cmd_backfill_keys(dry_run: bool) -> Result<i32> {
+    use cutover::{BackfillOutcome, BackfillRow};
+
+    let db = connect_db().await?;
+    let tenant = resolve_admin_tenant(&db).await?;
+    let community = tenant.community();
+
+    let now = chrono::Utc::now();
+    let name = format!("cutover-backfill-{}", now.format("%Y%m%dT%H%M%SZ"));
+
+    let rows = cutover::plan_backfill(&db, community, dry_run, &name, now).await?;
+
+    if rows.is_empty() {
+        eprintln!(
+            "no relay members for {} — nothing to backfill \
+             (issue keys individually with `issue-key` on open relays)",
+            tenant.host()
+        );
+        return Ok(0);
+    }
+
+    // TSV to stdout — the plaintext keys are printed here exactly once.
+    println!("{}", BackfillRow::tsv_header());
+    for row in &rows {
+        println!("{}", row.to_tsv());
+    }
+
+    let minted = rows
+        .iter()
+        .filter(|r| matches!(r.outcome, BackfillOutcome::Minted { .. }))
+        .count();
+    let would = rows
+        .iter()
+        .filter(|r| matches!(r.outcome, BackfillOutcome::WouldMint))
+        .count();
+    let skipped = rows
+        .iter()
+        .filter(|r| matches!(r.outcome, BackfillOutcome::SkippedActive))
+        .count();
+
+    if dry_run {
+        eprintln!(
+            "\ndry run: {would} key(s) would be minted, {skipped} skipped (already active), \
+             {} member(s) total. No changes were made.",
+            rows.len()
+        );
+    } else {
+        eprintln!(
+            "\nbackfill complete: {minted} key(s) minted, {skipped} skipped (already active), \
+             {} member(s) total. Store the plaintext keys above — they will NOT be shown again.",
+            rows.len()
+        );
+    }
+    Ok(0)
+}
+
+/// `cutover-genesis` — append the audit cutover-genesis entry per community.
+///
+/// Resolves either the single RELAY_URL community or, with `--all`, every
+/// community in the deployment. For each, pins the current audit head hash +
+/// timestamp into a [`buzz_audit::AuditService::append_cutover_genesis`] entry.
+/// Idempotent: a community that already carries a cutover-genesis entry is
+/// refused (single-community: exit 4; `--all`: reported and skipped).
+async fn cmd_cutover_genesis(all: bool) -> Result<i32> {
+    let db = connect_db().await?;
+
+    // A dedicated pool for the audit service (Db's pool is crate-private).
+    let db_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://buzz:buzz_dev@localhost:5432/buzz".to_string());
+    let pool = sqlx::PgPool::connect(&db_url).await?;
+    let audit = buzz_audit::AuditService::new(pool);
+
+    let targets: Vec<buzz_db::CommunityRecord> = if all {
+        db.list_all_communities().await?
+    } else {
+        let tenant = resolve_admin_tenant(&db).await?;
+        vec![buzz_db::CommunityRecord {
+            id: tenant.community(),
+            host: tenant.host().to_string(),
+        }]
+    };
+
+    if targets.is_empty() {
+        eprintln!("no communities to cut over.");
+        return Ok(0);
+    }
+
+    let now = chrono::Utc::now();
+    let (mut appended, mut skipped) = (0u32, 0u32);
+    for record in &targets {
+        match cutover::run_cutover_genesis(&audit, record.id, now).await? {
+            cutover::CutoverOutcome::AlreadyPresent => {
+                eprintln!(
+                    "skip {}: already carries a cutover-genesis entry (idempotent no-op)",
+                    record.host
+                );
+                skipped += 1;
+                if !all {
+                    return Ok(4);
+                }
+            }
+            cutover::CutoverOutcome::Appended { seq, pinned_head } => {
+                appended += 1;
+                if pinned_head.is_empty() {
+                    eprintln!(
+                        "note {}: no prior audit history; cutover-genesis is the chain's first entry",
+                        record.host
+                    );
+                }
+                println!(
+                    "{}: cutover-genesis appended at seq {seq} (pinned Nostr-era head {})",
+                    record.host,
+                    if pinned_head.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        hex::encode(&pinned_head)
+                    }
+                );
+            }
+        }
+    }
+
+    eprintln!(
+        "\ncutover-genesis complete: {appended} appended, {skipped} skipped, {} community(ies) total.",
+        targets.len()
     );
     Ok(0)
 }

@@ -699,6 +699,36 @@ impl Db {
         .transpose()
     }
 
+    /// List every active (non-archived) community as `(id, host)` pairs,
+    /// ordered by host for stable operator output.
+    ///
+    /// Operator-plane only — used by the `buzz-admin` cutover tooling to sweep
+    /// every community in a deployment (`cutover-genesis --all`). Archived
+    /// communities are excluded, mirroring [`Db::lookup_community_by_host`].
+    pub async fn list_all_communities(&self) -> Result<Vec<CommunityRecord>> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, host
+            FROM communities
+            WHERE archived_at IS NULL
+            ORDER BY host ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let id: Uuid = row.try_get("id")?;
+                let host: String = row.try_get("host")?;
+                Ok(CommunityRecord {
+                    id: CommunityId::from_uuid(id),
+                    host,
+                })
+            })
+            .collect()
+    }
+
     /// Returns whether a community id still exists in the active lifecycle state.
     pub async fn is_community_active(&self, community_id: CommunityId) -> Result<bool> {
         let active = sqlx::query_scalar::<_, bool>(
@@ -3968,6 +3998,30 @@ mod tests {
             .await
             .expect("insert community");
         id
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn list_all_communities_returns_active_and_excludes_archived() {
+        let db = setup_db().await;
+        let active = make_community(&db.pool).await;
+        let archived = make_community(&db.pool).await;
+
+        // Archive the second community.
+        sqlx::query("UPDATE communities SET archived_at = NOW() WHERE id = $1")
+            .bind(archived)
+            .execute(&db.pool)
+            .await
+            .expect("archive community");
+
+        let all = db.list_all_communities().await.expect("list");
+        let ids: Vec<Uuid> = all.iter().map(|c| *c.id.as_uuid()).collect();
+
+        assert!(ids.contains(&active), "active community must be listed");
+        assert!(
+            !ids.contains(&archived),
+            "archived community must be excluded"
+        );
     }
 
     #[tokio::test]
