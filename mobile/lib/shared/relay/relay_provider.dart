@@ -1,6 +1,6 @@
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
-import '../../community/community_provider.dart';
+import '../community/community_provider.dart';
 import 'relay_client.dart';
 
 /// Relay connection configuration.

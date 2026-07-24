@@ -20,11 +20,9 @@ class SignedEventRelay {
   final RelaySessionNotifier _session;
   final String? _actorPubkey;
 
-  SignedEventRelay({
-    required RelaySessionNotifier session,
-    String? actorPubkey,
-  }) : _session = session,
-       _actorPubkey = actorPubkey;
+  SignedEventRelay({required RelaySessionNotifier session, String? actorPubkey})
+    : _session = session,
+      _actorPubkey = actorPubkey;
 
   /// This actor's opaque id, or null when unknown (server still authors rows).
   String? get pubkey {

@@ -60,7 +60,8 @@ class RelaySocket {
 
     final apiKey = _apiKey;
     final headers = <String, dynamic>{
-      if (apiKey != null && apiKey.isNotEmpty) 'Authorization': 'Bearer $apiKey',
+      if (apiKey != null && apiKey.isNotEmpty)
+        'Authorization': 'Bearer $apiKey',
     };
 
     try {

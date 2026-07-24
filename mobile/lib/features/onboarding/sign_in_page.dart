@@ -61,7 +61,9 @@ class SignInPage extends HookConsumerWidget {
     }
 
     return Scaffold(
-      appBar: addingCommunity ? AppBar(title: const Text('Add Community')) : null,
+      appBar: addingCommunity
+          ? AppBar(title: const Text('Add Community'))
+          : null,
       body: SafeArea(
         child: Center(
           child: SingleChildScrollView(

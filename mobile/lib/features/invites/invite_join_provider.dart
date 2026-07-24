@@ -135,7 +135,12 @@ class InviteJoinNotifier extends Notifier<InviteJoinState> {
       }
       final claim = Map<String, dynamic>.from(decoded);
 
-      final apiKey = _stringField(claim, const ['api_key', 'apiKey', 'token', 'key']);
+      final apiKey = _stringField(claim, const [
+        'api_key',
+        'apiKey',
+        'token',
+        'key',
+      ]);
       if (apiKey == null || apiKey.isEmpty) {
         throw const InviteClaimException(
           'Invite claim did not return an API key.',
