@@ -32,16 +32,25 @@ otherwise. The read authorization gates (channel membership + p-gate /
 author-only / result-gated / engram) are load-bearing in **both** modes — never
 weaken them.
 
+**Migration status: code-complete.** All lanes are implemented and verified in
+a full environment — server, CLI/agents, desktop, web, and mobile all pass
+their gates in both auth modes; see the status banner atop
+[FULL_TESTS.md](FULL_TESTS.md) for the evidence. Client-side E2E encryption
+(NIP-44/NIP-17) is **fully removed** everywhere, including the agent
+observer/turn-metric path — those kinds are now plaintext protected solely by
+the server read gates (p-gate/result-gate), which is exactly why those gates
+must never be weakened. The only remaining step is the operational flag flip on
+a real deployment.
+
 **Migration docs:**
 - [REFACTOR.md](REFACTOR.md) — design, locked decisions, per-lane plan.
 - [GREEN_GATE.md](GREEN_GATE.md) — the "is the tree green?" checklist.
-- [FULL_TESTS.md](FULL_TESTS.md) — setup + remaining steps to finish/verify in a
-  full environment (mobile Flutter, desktop Playwright, Postgres/Redis
-  integration suite, E2E-encryption removal, audit-test review).
-
-Client-side E2E encryption (NIP-44/NIP-17) is being **dropped** in the apikey
-model (trust-the-server); some desktop/web removal is still pending (see
-FULL_TESTS.md §5.E).
+- [FULL_TESTS.md](FULL_TESTS.md) — full-environment verification record.
+- [CUTOVER.md](CUTOVER.md) — operator runbook for the flag flip
+  (`buzz-admin backfill-keys` / `cutover-genesis`, WORM anchoring env,
+  `BUZZ_AUTH_MODE=apikey`).
+- [DEV.md](DEV.md) — current branch state and next steps, including
+  machine-specific environment notes.
 
 ---
 
@@ -91,8 +100,6 @@ crates/
   buzz-persona        # Agent persona packs
   buzz-workflow       # YAML-as-code workflow engine (evalexpr conditions)
   # Clients + interop
-  buzz-pair-relay     # Ephemeral sidecar relay for NIP-AB device pairing
-  buzz-pairing-cli    # CLI for NIP-AB device pairing interop testing
   git-credential-nostr # Git credential helper for bearer-authed push/fetch
   # Tooling + shared
   buzz-cli            # Agent-first CLI
@@ -379,9 +386,22 @@ Add specs to `desktop/tests/e2e/` and register them in `playwright.config.ts`
 (`smoke` project `testMatch`). Every test calls `installMockBridge(page)` for
 mock Tauri IPC. Mock pubkey, channel names, and UUIDs live in `e2eBridge.ts`.
 
+**Build with `pnpm run build:e2e`, never plain `build`:** the production build
+strips the mock Tauri bridge entirely (`main.tsx` gates it on dev/e2e mode), so
+after a plain `pnpm run build` every Playwright test fails with
+`Cannot read properties of undefined (reading 'invoke')`.
+
 **Stale server:** `reuseExistingServer: true` means a previous build's server
-serves old code. Kill port 4173 and `pnpm run build` before re-running tests
-after code changes.
+serves old code. Kill port 4173 and `pnpm run build:e2e` before re-running
+tests after code changes.
+
+**Relay-backed specs** (`stream`/`integration`/`dm-double-notification`/
+`parity-ancestor-island`, the `integration` Playwright project) need a live
+relay started with CI's env — rate limits raised to 100000 and
+`BUZZ_RECONCILE_CHANNELS=true` (copy the "Start relay" block from
+`.github/workflows/ci.yml`) — then `bash scripts/setup-desktop-test-data.sh`.
+They also assume a **clean** fixture community: events accumulated from prior
+local runs cause feed-assertion failures that are not code signals.
 
 **`addInitScript` before bridge:** `page.addInitScript` (localStorage seeding)
 must run BEFORE `installMockBridge(page)` — React reads state on mount, the
@@ -453,6 +473,8 @@ description. See [PR #803](https://github.com/block/buzz/pull/803).
 5. **Desktop crate excluded from root workspace** — `cargo test` at repo root does NOT run desktop tests. Use `cargo test --manifest-path desktop/src-tauri/Cargo.toml` explicitly.
 6. **Desktop Tauri fmt fails in worktrees and blocks commits** — the pre-commit hook runs `just desktop-tauri-fmt`, which fails in git worktrees because `cargo fmt` resolves workspace paths relative to the worktree root. Run `just desktop-tauri-fmt` from the main checkout to apply the fix, then re-stage and commit. CI is unaffected.
 7. **React render perf: `React.memo` is all-or-nothing** — it only skips a re-render when *every* prop is reference-stable; one unstable prop (inline arrow/JSX, or a hook returning a fresh `{}`/`[]`/`Map` each render) defeats it. Two repeat offenders: (a) React Query results (`useMutation`/`useQuery`) are a **new object each render** — depend on the stable method (`mutation.mutateAsync`), not the object; (b) derived `Map`/array state that recomputes on a version bump — wrap in a content-equality ref cache (`shared/hooks/useStableReference.ts`). When chasing interaction lag, **measure with DevTools closed and no perf probes** (an open Web Inspector + per-keystroke `console.log` inflate the numbers), and isolate by removing one suspect at a time rather than guessing.
+8. **`cargo test --workspace -- --include-ignored` is destructive** — the `buzz-db` migration tests `DROP SCHEMA public CASCADE` and are not mutex-serialized, so a workspace-wide `--include-ignored` run can wipe the schema out from under concurrently running Postgres-gated tests (which then panic with "requires reachable Postgres" — contention, not breakage). Run `cargo test -p buzz-db -- --include-ignored --test-threads=1` separately and re-apply migrations (`cargo run -p buzz-admin -- migrate`) afterwards.
+9. **Legacy NIP-44 ciphertext reads as absent, by design** — formerly owner-encrypted kinds (read-state, stars/mutes/sections/sort, reminders, observer frames, turn metrics) are plaintext JSON now; consumers parse plaintext-first and silently skip content that fails to parse. Do not add decrypt fallbacks, and do not "fix" the silent skip — a one-time state reset at migration is the accepted behavior (REFACTOR.md decision #5).
 
 ---
 
